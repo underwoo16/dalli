@@ -32,6 +32,7 @@ RUN sudo chown -R $USERNAME:$USERNAME /usr/local/bundle
 RUN gem install bundler
 
 WORKDIR /workspace
+RUN chown $USERNAME:$USERNAME /workspace
 
 # Switch to non-root user
 USER $USERNAME
