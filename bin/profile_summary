@@ -18,7 +18,7 @@ def function_name(thread, func_idx)
   funcs = thread['funcTable']
   name = thread['stringArray'][funcs['name'][func_idx]]
   file = funcs['fileName'][func_idx]
-  file = file && thread['stringArray'][file]
+  file &&= thread['stringArray'][file]
   line = funcs['lineNumber'][func_idx]
   location = file ? " (#{file.sub(%r{.*/(lib/|gems/)}, '\1')}#{":#{line}" if line})" : ''
   "#{name}#{location}"
