@@ -142,15 +142,20 @@ optimization. Use the repository's existing devcontainer, `bin/benchmark` and
    tests. Use read-only `gh pr list --state open --label performance --limit 3`
    to inspect existing work, including drafts. If three PRs are open, call `noop`.
    Avoid overlapping existing PRs or repeating rejected optimizations.
-2. Use `mcpscripts measure --operation benchmark --target get --payload 100`
+2. Use `mcpscripts measure --operation profile --target get --payload 100`
    (adjusting the allowlisted operation, target and payload) for benchmark, profiling, test, and lint
-   execution. Its fixed commands run in fresh offline containers built from
+   execution. Each call runs exactly one target and payload, so call it in a loop to
+   cover every combination. Its fixed commands run in fresh offline containers built from
    `.devcontainer/Dockerfile` and initialized with `.devcontainer/setup.sh`.
    Source is mounted read-only, with computation and generated files confined to
    disposable container storage. No credentials or Docker socket are passed in.
    Read the tool's returned output file when the result is too large to inline.
-3. Before editing, run baseline benchmarks and profiles for the affected
-   operation. Inspect profile samples/stacks to identify a concrete bottleneck.
+3. **Survey broadly, starting with profiles.** Before choosing a candidate, run
+   `profile` for each of `get`, `set`, `get_multi` and `set_multi` at payloads 100 and
+   4096 (plus 700000 where large values matter). Rank hotspots by self and total
+   time and by allocations, and read the relevant source. Choose the candidate from
+   the profile, then confirm it with benchmarks. A clear hotspot is a valid lead even
+   when throughput is noisy. Do not anchor on `get`.
    Save the actual output in the agent workspace outside the repository.
 4. Make one small optimization in `lib/` with regression coverage in `test/`.
    Only fully backwards-compatible changes qualify: preserve public APIs,
@@ -159,10 +164,19 @@ optimization. Use the repository's existing devcontainer, `bin/benchmark` and
    Do not raise minimum Ruby/memcached versions, add dependencies, weaken tests,
    modify the benchmark harness, or change workflows/devcontainer configuration.
 5. Re-run the same benchmark and profile configurations after the change. Obtain
-   at least three benchmark runs per revision with identical target, payload,
+   at least five benchmark runs per revision, alternating baseline and candidate
+   runs (A/B/A/B) so drift affects both equally, and compare medians and spread
+   (coefficient of variation) with identical target, payload,
    YJIT, warmup, timing, CPU/memory limits, and dependency versions. Include small
-   and large payloads and relevant adjacent operations. Reject noise-only gains
-   or changes that regress other operations; revert unsuccessful experiments.
+   and large payloads and relevant adjacent operations. Treat a gain as real
+   when the median improvement exceeds the run-to-run spread. If throughput is too
+   noisy to tell, use lower-noise evidence instead: fewer allocations, objects or
+   method calls in the profile, or a reduced amount of work per operation. Such a
+   deterministic reduction can justify a change even when throughput is within noise,
+   provided it is shown and no operation regresses. Reject changes that regress
+   other operations; revert unsuccessful experiments.
+   If a baseline is noisy, do not stop: rerun with more runs, move to another
+   target or payload, or fall back to profile/allocation evidence.
 6. Require successful `measure(operation: "lint")` (`bundle exec rubocop`) and
    `measure(operation: "test")` (`bundle exec rake`) after the final edit.
    Review the diff for compatibility, security, and accidental generated files.
@@ -184,7 +198,12 @@ The PR description must include:
   Include representative raw output, not just a claim or an inaccessible file path.
 - Test/lint results and any remaining limitations, plus a link to this Actions run.
 
-Call `noop` with a short reason if there is no meaningful measured improvement,
-the change overlaps existing work, compatibility is uncertain, or the PR budget
-is exhausted. If tooling, dependencies, or validation are unavailable or fail,
+Call `noop` only after the escalation above: all four targets profiled at multiple
+payloads, noise handled via repeated A/B runs and profile/allocation evidence, and at
+least one concrete candidate tried or rejected with reasons. Also use it if the
+change overlaps existing work, compatibility is uncertain, or the PR budget is
+exhausted. A noisy benchmark on one target is never sufficient reason. The `noop`
+message must list: targets and payloads measured, observed run-to-run variance, the
+top profile hotspots, and the candidate ideas considered and why each was rejected.
+If tooling, dependencies, or validation are unavailable or fail,
 do not request a PR; report the incomplete investigation instead.
