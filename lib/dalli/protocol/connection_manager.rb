@@ -253,6 +253,9 @@ module Dalli
       # is sent once it grows past this size, or when a reply is read.
       WRITE_BUFFER_FLUSH_BYTES = 64 * 1024
 
+      # Above this many buffered parts a flush joins them rather than gathering them
+      MAX_VECTORED_PARTS = 8
+
       def write(bytes)
         @write_buffer << bytes
         @write_buffer_bytes += bytes.bytesize
@@ -370,8 +373,20 @@ module Dalli
       def flush_write_buffer
         return if @write_buffer.empty?
 
-        @sock.write(@write_buffer.size == 1 ? @write_buffer.first : joined_write_buffer)
+        if @write_buffer.size == 1
+          @sock.write(@write_buffer.first)
+        elsif @write_buffer.size <= MAX_VECTORED_PARTS && vectored_write?
+          @sock.write(*@write_buffer)
+        else
+          @sock.write(joined_write_buffer)
+        end
         discard_write_buffer
+      end
+
+      # Plain sockets gather the parts into one writev without copying them.
+      # TLS sockets would send each part as its own record, so they get a joined string.
+      def vectored_write?
+        @sock.is_a?(::TCPSocket) || @sock.is_a?(::UNIXSocket)
       end
 
       # Joined as bytes: requests can mix UTF-8 and binary strings, which

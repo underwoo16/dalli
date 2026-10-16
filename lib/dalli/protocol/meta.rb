@@ -14,6 +14,10 @@ module Dalli
     class Meta < Base
       TERMINATOR = "\r\n"
 
+      # Values this large are buffered as separate parts rather than copied
+      # into one interpolated string; a plain socket sends them with one writev.
+      LARGE_VALUE_BYTES = 16 * 1024
+
       def response_processor
         @response_processor ||= ResponseProcessor.new(@connection_manager, @value_marshaller)
       end
@@ -167,10 +171,20 @@ module Dalli
                                           ttl: ttl, mode: mode, quiet: quiet,
                                           **routing_token_kwargs(options))
               end
-        write("#{req}#{value}#{TERMINATOR}")
+        write_storage_payload(req, value)
         finish_write(quiet)
       end
       # rubocop:enable Metrics/ParameterLists
+
+      def write_storage_payload(req, value)
+        if value.bytesize < LARGE_VALUE_BYTES
+          write("#{req}#{value}#{TERMINATOR}")
+        else
+          write(req)
+          write(value)
+          write(TERMINATOR)
+        end
+      end
 
       def append(key, value, options = nil)
         write_append_prepend_req(:append, key, value, nil, nil, options)
