@@ -369,6 +369,41 @@ describe Dalli::Protocol::ConnectionManager do
       assert_equal Encoding::BINARY, calls[0][0].encoding
     end
 
+    it 'sends buffered parts to a plain socket in one vectored write, joined in order' do
+      calls = []
+      sock = Class.new(TCPSocket) do
+        define_method(:write) do |*parts|
+          calls << parts
+          parts.sum(&:bytesize)
+        end
+      end.allocate
+      connection_manager.instance_variable_set(:@sock, sock)
+
+      connection_manager.write('ms k 3 c')
+      connection_manager.write('abc'.b)
+      connection_manager.write("\r\n")
+      connection_manager.flush
+
+      assert_equal [['ms k 3 c', 'abc'.b, "\r\n"]], calls
+    end
+
+    it 'joins many buffered parts for a plain socket instead of passing them all to write' do
+      calls = []
+      sock = Class.new(TCPSocket) do
+        define_method(:write) do |*parts|
+          calls << parts
+          parts.sum(&:bytesize)
+        end
+      end.allocate
+      connection_manager.instance_variable_set(:@sock, sock)
+      count = Dalli::Protocol::ConnectionManager::MAX_VECTORED_PARTS + 1
+
+      count.times { connection_manager.write('x') }
+      connection_manager.flush
+
+      assert_equal [['x' * count]], calls
+    end
+
     it 'sends the buffer once it grows past the flush size' do
       big = 'x' * Dalli::Protocol::ConnectionManager::WRITE_BUFFER_FLUSH_BYTES
 
