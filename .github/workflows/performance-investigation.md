@@ -88,11 +88,9 @@ mcp-scripts:
           case "$1" in
             benchmark) bundle exec bin/benchmark ;;
             profile)
-              bundle exec bin/profile
-              for profile in *_profile.json; do
-                printf "\n--- %s ---\n" "$profile"
-                cat "$profile"
-              done
+              bundle exec bin/profile > /tmp/profile.log 2>&1 || { tail -n 40 /tmp/profile.log; exit 1; }
+              grep -E "^(yjit|Warming|Calculating)|i/s|Comparison" /tmp/profile.log | head -n 60 || true
+              bundle exec bin/profile_summary --top 12 *_profile.json
               ;;
             test) bundle exec rake ;;
             lint) bundle exec rubocop --cache false ;;
@@ -149,7 +147,9 @@ optimization. Use the repository's existing devcontainer, `bin/benchmark` and
    `.devcontainer/Dockerfile` and initialized with `.devcontainer/setup.sh`.
    Source is mounted read-only, with computation and generated files confined to
    disposable container storage. No credentials or Docker socket are passed in.
-   Read the tool's returned output file when the result is too large to inline.
+   Profile output is a compact top-function summary per profile, not raw Vernier JSON.
+   Keep all tool output and your own messages small: never print or paste large raw
+   files, and use `head`/`grep`/`jq` on any saved output.
 3. **Survey broadly, starting with profiles.** Before choosing a candidate, run
    `profile` for each of `get`, `set`, `get_multi` and `set_multi` at payloads 100 and
    4096 (plus 700000 where large values matter). Rank hotspots by self and total
@@ -180,6 +180,14 @@ optimization. Use the repository's existing devcontainer, `bin/benchmark` and
 6. Require successful `measure(operation: "lint")` (`bundle exec rubocop`) and
    `measure(operation: "test")` (`bundle exec rake`) after the final edit.
    Review the diff for compatibility, security, and accidental generated files.
+
+## Keep output small
+
+The run's step summary is capped at 1 MiB and the run fails if it is exceeded, so
+everything you print or write counts. Never cat or echo raw profile JSON or full
+benchmark logs. Quote only the relevant excerpts (a few dozen lines at most) in your
+reasoning, final messages, and the PR description, and keep any final summary or
+`noop` message under about 3,000 characters.
 
 ## Publish only a justified change
 

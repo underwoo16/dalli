@@ -1,0 +1,61 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Prints a compact hotspot summary (top functions by self and total samples) for Vernier profiles.
+#
+# run with:
+# bundle exec bin/profile_summary [--top N] *_profile.json
+require 'json'
+
+top = 15
+files = ARGV.dup
+if (idx = files.index('--top'))
+  top = files[idx + 1].to_i
+  files.slice!(idx, 2)
+end
+
+def function_name(thread, func_idx)
+  funcs = thread['funcTable']
+  name = thread['stringArray'][funcs['name'][func_idx]]
+  file = funcs['fileName'][func_idx]
+  file = file && thread['stringArray'][file]
+  line = funcs['lineNumber'][func_idx]
+  location = file ? " (#{file.sub(%r{.*/(lib/|gems/)}, '\1')}#{":#{line}" if line})" : ''
+  "#{name}#{location}"
+end
+
+def summarize_thread(thread, top)
+  samples = thread['samples']
+  stacks = thread['stackTable']
+  frames = thread['frameTable']
+  total = samples['stack'].compact.size
+  return if total.zero?
+
+  self_counts = Hash.new(0)
+  total_counts = Hash.new(0)
+  samples['stack'].each do |stack|
+    next if stack.nil?
+
+    self_counts[frames['func'][stacks['frame'][stack]]] += 1
+    seen = {}
+    while stack
+      func = frames['func'][stacks['frame'][stack]]
+      total_counts[func] += 1 unless seen[func]
+      seen[func] = true
+      stack = stacks['prefix'][stack]
+    end
+  end
+
+  puts "  thread=#{thread['name']} samples=#{total}"
+  { 'self' => self_counts, 'total' => total_counts }.each do |label, counts|
+    puts "  top #{label}:"
+    counts.max_by(top) { |_, count| count }.each do |func, count|
+      puts format('    %<pct>5.1f%% %<name>s', pct: 100.0 * count / total, name: function_name(thread, func))
+    end
+  end
+end
+
+files.each do |file|
+  puts "--- #{file} ---"
+  JSON.parse(File.read(file))['threads'].each { |thread| summarize_thread(thread, top) }
+end
