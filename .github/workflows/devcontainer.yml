@@ -62,6 +62,8 @@ jobs:
     # The container user gets the runner's uid so it can write to the mounted checkout
     - name: Build the devcontainer image
       run: docker build --build-arg USER_UID="$(id -u)" -t dalli-devcontainer .devcontainer
+    - name: Check the container user can write to the unmounted workspace
+      run: docker run --rm dalli-devcontainer sh -c 'touch /workspace/.write-test && rm /workspace/.write-test'
     - name: Run setup and tests in the devcontainer
       run: |
         docker run --rm -v "$PWD":/workspace -w /workspace dalli-devcontainer \
