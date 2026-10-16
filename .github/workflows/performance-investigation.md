@@ -121,7 +121,9 @@ safe-outputs:
     draft: true
     fallback-as-issue: false
     allowed-files:
+      - lib/*.rb
       - lib/**/*.rb
+      - test/*.rb
       - test/**/*.rb
     protected-files: blocked
   noop:
