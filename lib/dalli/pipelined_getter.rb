@@ -76,7 +76,7 @@ module Dalli
           Dalli.logger.debug { e.inspect }
           Dalli.logger.debug { "unable to get keys for server #{server.name}" }
         end
-        results.transform_keys! { |key| @key_manager.key_without_namespace(key) }
+        results.transform_keys! { |key| @key_manager.key_without_namespace(key) } if @key_manager.namespace
         results
       end
     rescue Dalli::RetryableNetworkError => e

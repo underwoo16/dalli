@@ -47,6 +47,16 @@ describe 'Namespace and key behavior' do
         end
       end
 
+      it 'returns keys unchanged in get_multi without a namespace' do
+        memcached_persistent(p) do |_, port|
+          dc = Dalli::Client.new("localhost:#{port}")
+          dc.set('a', 1)
+          dc.set('b', 2)
+
+          assert_equal({ 'a' => 1, 'b' => 2 }, dc.get_multi('a', 'b'))
+        end
+      end
+
       it 'handles special Regexp characters in namespace with get_multi' do
         memcached_persistent(p) do |_, port|
           # /(?!)/ is a contradictory PCRE and should never be able to match

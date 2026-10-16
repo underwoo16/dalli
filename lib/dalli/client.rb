@@ -828,7 +828,7 @@ module Dalli
       return {} unless (server = single_server)
 
       result = server.request(:read_multi_req, validated_keys, req_options)
-      result.transform_keys! { |k| @key_manager.key_without_namespace(k) }
+      result.transform_keys! { |k| @key_manager.key_without_namespace(k) } if @key_manager.namespace
       result
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
@@ -841,7 +841,7 @@ module Dalli
       return {} unless (server = single_server)
 
       result = server.request(:read_multi_with_metadata_req, validated_keys, req_options)
-      result.transform_keys! { |k| @key_manager.key_without_namespace(k) }
+      result.transform_keys! { |k| @key_manager.key_without_namespace(k) } if @key_manager.namespace
       result
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
