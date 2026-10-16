@@ -139,9 +139,20 @@ optimization. Use the repository's existing devcontainer, `bin/benchmark` and
 ## Investigate and measure
 
 1. Read `CONTRIBUTING.md`, `CLAUDE.md`, `Performance.md`, and the relevant source and
-   tests. Use read-only `gh pr list --state open --label performance --limit 3`
-   to inspect existing work, including drafts. If three PRs are open, call `noop`.
-   Avoid overlapping existing PRs or repeating rejected optimizations.
+   tests. Then, before any profiling, build a "covered ground" list using read-only
+   commands:
+   - `gh pr list --state open --label performance --limit 10` (including drafts). If
+     three or more are open, call `noop`.
+   - `gh pr list --state merged --label performance --limit 30` and
+     `gh pr list --state closed --label performance --limit 30` for landed and
+     rejected work; read closing comments and reviews to learn why PRs were rejected.
+   - `gh pr list --state open --search "performance OR optimize OR faster OR allocation" --limit 20`
+     to catch unlabeled work.
+   - `gh pr diff <number>` for each relevant PR, and `git log --oneline -30 -- lib`
+     for recent changes to `lib/`.
+   Record which files, methods and ideas each item covers. Do not investigate or
+   propose anything on that list: skip hotspots it covers and look at the next one.
+   Do not repeat rejected optimizations.
 2. Use `mcpscripts measure --operation profile --target get --payload 100`
    (adjusting the allowlisted operation, target and payload) for benchmark, profiling, test, and lint
    execution. Each call runs exactly one target and payload, so call it in a loop to
@@ -214,6 +225,6 @@ least one concrete candidate tried or rejected with reasons. Also use it if the
 change overlaps existing work, compatibility is uncertain, or the PR budget is
 exhausted. A noisy benchmark on one target is never sufficient reason. The `noop`
 message must list: targets and payloads measured, observed run-to-run variance, the
-top profile hotspots, and the candidate ideas considered and why each was rejected.
+top profile hotspots, the candidate ideas considered and why each was rejected, and any skipped because existing or past PRs already cover them.
 If tooling, dependencies, or validation are unavailable or fail,
 do not request a PR; report the incomplete investigation instead.
