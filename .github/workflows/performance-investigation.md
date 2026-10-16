@@ -3,7 +3,7 @@ name: Performance investigation
 description: Find measured, backwards-compatible Dalli optimizations in the development container.
 intent: Improve Dalli performance without changing existing behavior or overwhelming maintainers.
 on:
-  schedule: weekly
+  schedule: every 3 days
   workflow_dispatch:
   skip-if-match:
     query: is:pr is:open label:performance
