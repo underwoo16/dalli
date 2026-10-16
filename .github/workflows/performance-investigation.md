@@ -116,6 +116,7 @@ jobs:
               }
             }
 safe-outputs:
+  report-failure-as-issue: false
   create-pull-request:
     max: 1
     labels: [performance]
@@ -126,6 +127,7 @@ safe-outputs:
       - test/**/*.rb
     protected-files: blocked
   noop:
+    report-as-issue: false
 ---
 
 # Performance investigation
