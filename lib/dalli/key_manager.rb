@@ -27,6 +27,10 @@ module Dalli
 
     OPTIONS = %i[digest_class namespace namespace_separator].freeze
 
+    # Longest key (in bytes) whose wire length is within MAX_KEY_LENGTH even
+    # when it must be base64 encoded: ((186 + 2) / 3) * 4 == 248.
+    ALWAYS_FITS_BYTES = 186
+
     attr_reader :namespace, :namespace_separator
 
     # Valid separators: non-alphanumeric, single printable ASCII characters
@@ -58,6 +62,8 @@ module Dalli
       raise ArgumentError, 'key cannot be blank' unless key&.length&.positive?
 
       key = key_with_namespace(key)
+      return key if key.bytesize <= ALWAYS_FITS_BYTES
+
       wire_length(key) > MAX_KEY_LENGTH ? truncated_key(key) : key
     end
 

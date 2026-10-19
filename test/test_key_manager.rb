@@ -363,6 +363,13 @@ describe 'KeyManager' do
       end
     end
 
+    it 'handles keys at the 186/187 byte base64 boundary' do
+      assert_equal "#{'k' * 185} ", key_manager.validate_key("#{'k' * 185} ")
+      assert_equal 'k' * 186, key_manager.validate_key('k' * 186)
+      assert_equal 'k' * 187, key_manager.validate_key('k' * 187)
+      assert_includes key_manager.validate_key("#{'k' * 186} x"), ':md5:'
+    end
+
     it 'truncates keys that are short enough in characters but too long once base64-encoded' do
       ["search:#{'é' * 130}", 'é' * 250, "#{'k' * 185} x", ' ' * 260, '😀' * 100].each do |key|
         validated = key_manager.validate_key(key)
