@@ -470,4 +470,51 @@ describe 'KeyManager' do
       end
     end
   end
+
+  describe 'validate_keys and original_key' do
+    let(:key_manager) { Dalli::KeyManager.new(options) }
+    let(:long_key) { "long#{'x' * 300}" }
+    let(:keys) { ['plain', :symbol, 'myapp:self_prefixed', 'with space é', long_key] }
+
+    [
+      {},
+      { namespace: 'myapp' },
+      { namespace: -> { 'myapp' } },
+      { namespace: 'a.b', namespace_separator: '|' }
+    ].each do |opts|
+      describe "with options #{opts.keys}" do
+        let(:options) { opts }
+
+        it 'returns the same validated keys as validate_key' do
+          validated, = key_manager.validate_keys(keys)
+
+          assert_equal(keys.map { |k| key_manager.validate_key(k.to_s) }, validated)
+        end
+
+        it 'resolves every validated key to the original string key' do
+          validated, original_keys = key_manager.validate_keys(keys)
+
+          validated.each_with_index do |validated_key, index|
+            original_key = keys[index].to_s
+
+            assert_equal original_key, key_manager.original_key(validated_key, original_keys)
+          end
+        end
+
+        it 'falls back to key_without_namespace for keys missing from the original_keys' do
+          key = key_manager.validate_key('unknown')
+
+          assert_equal key_manager.key_without_namespace(key), key_manager.original_key(key, {})
+        end
+      end
+    end
+
+    describe 'with an empty key' do
+      let(:options) { {} }
+
+      it 'raises like validate_key' do
+        assert_raises(ArgumentError) { key_manager.validate_keys(['ok', '']) }
+      end
+    end
+  end
 end

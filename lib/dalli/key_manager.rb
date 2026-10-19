@@ -55,10 +55,29 @@ module Dalli
     # combined with a 32-byte hex digest of the whole key.
     ##
     def validate_key(key)
-      raise ArgumentError, 'key cannot be blank' unless key&.length&.positive?
+      validate_and_record(key, nil)
+    end
 
-      key = key_with_namespace(key)
-      wire_length(key) > MAX_KEY_LENGTH ? truncated_key(key) : key
+    ##
+    # Validates every key like #validate_key and also returns a hash,
+    # original_keys, of validated (wire) key => key without its namespace.
+    # Passing a response key to #original_key then avoids a regexp
+    # substitution per returned key.
+    # Returns [validated_keys, original_keys].
+    ##
+    def validate_keys(keys)
+      original_keys = {}
+      validated = keys.map { |key| validate_and_record(key.to_s, original_keys) }
+      [validated, original_keys]
+    end
+
+    ##
+    # Returns the key without its namespace, using the original_keys hash
+    # built by #validate_keys and falling back to #key_without_namespace for keys it
+    # does not contain.
+    ##
+    def original_key(key, original_keys)
+      original_keys.fetch(key) { key_without_namespace(key) }
     end
 
     ##
@@ -75,6 +94,16 @@ module Dalli
       return key if namespace.nil?
 
       key.sub(namespace_regexp, '')
+    end
+
+    def validate_and_record(key, original_keys)
+      raise ArgumentError, 'key cannot be blank' unless key&.length&.positive?
+
+      namespaced = key_with_namespace(key)
+      truncate = wire_length(namespaced) > MAX_KEY_LENGTH
+      validated = truncate ? truncated_key(namespaced) : namespaced
+      original_keys[validated] = key if original_keys
+      validated
     end
 
     def digest_class

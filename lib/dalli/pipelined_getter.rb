@@ -15,6 +15,7 @@ module Dalli
     def initialize(ring, key_manager)
       @ring = ring
       @key_manager = key_manager
+      @original_keys = {}
     end
 
     ##
@@ -76,7 +77,7 @@ module Dalli
           Dalli.logger.debug { e.inspect }
           Dalli.logger.debug { "unable to get keys for server #{server.name}" }
         end
-        results.transform_keys! { |key| @key_manager.key_without_namespace(key) }
+        results.transform_keys! { |key| @key_manager.original_key(key, @original_keys) }
         results
       end
     rescue Dalli::RetryableNetworkError => e
@@ -89,7 +90,7 @@ module Dalli
 
     def yield_partial_results
       @partial_results.each_pair do |key, value_list|
-        yield @key_manager.key_without_namespace(key), value_list
+        yield @key_manager.original_key(key, @original_keys), value_list
       end
       @partial_results.clear
     end
@@ -206,7 +207,7 @@ module Dalli
     # additional responses from this server.
     def process_server(server)
       server.pipeline_next_responses do |key, value, cas|
-        yield @key_manager.key_without_namespace(key), [value, cas]
+        yield @key_manager.original_key(key, @original_keys), [value, cas]
       end
 
       server.pipeline_complete?
@@ -227,7 +228,7 @@ module Dalli
 
     def groups_for_keys(*keys)
       keys.flatten!
-      keys.map! { |a| @key_manager.validate_key(a.to_s) }
+      keys, @original_keys = @key_manager.validate_keys(keys)
       groups = @ring.keys_grouped_by_server(keys)
       if (unfound_keys = groups.delete(nil))
         Dalli.logger.debug do
