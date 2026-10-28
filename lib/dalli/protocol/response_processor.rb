@@ -456,7 +456,7 @@ module Dalli
         end
 
         def check_value_size!(size)
-          return if size.between?(0, MAX_VALUE_BYTES)
+          return if size >= 0 && size <= MAX_VALUE_BYTES # rubocop:disable Style/ComparableBetween -- between? is a hot-path method call
 
           raise Dalli::DalliError, "Reply value size #{size} is out of range"
         end

@@ -217,7 +217,7 @@ module Dalli
       MAX_READ_BYTES = (1024 * 1024 * 1024) + 2 # plus the value's trailing "\r\n"
 
       def check_read_size!(count)
-        return if count.between?(0, MAX_READ_BYTES)
+        return if count >= 0 && count <= MAX_READ_BYTES # rubocop:disable Style/ComparableBetween -- between? is a hot-path method call
 
         raise Dalli::DalliError, "Reply size #{count} from #{name} is out of range"
       end

@@ -125,6 +125,13 @@ describe Dalli::Protocol::ConnectionManager do
         assert_raises(Dalli::DalliError) { connection_manager.read(count) }
       end
     end
+
+    it 'accepts the boundary sizes without raising the range error' do
+      max = Dalli::Protocol::ConnectionManager::MAX_READ_BYTES
+
+      [0, max].each { |count| connection_manager.send(:check_read_size!, count) }
+      assert_raises(Dalli::DalliError) { connection_manager.send(:check_read_size!, max + 1) }
+    end
   end
 
   describe '#read_line length limit' do

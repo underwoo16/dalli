@@ -30,6 +30,18 @@ describe Dalli::Protocol::Meta::ResponseProcessor do
     end
   end
 
+  describe '#check_value_size!' do
+    it 'accepts sizes from 0 up to the maximum and rejects those outside it' do
+      max = Dalli::Protocol::Meta::ResponseProcessor::MAX_VALUE_BYTES
+
+      [0, 1, max].each { |size| processor.check_value_size!(size) }
+
+      [-1, max + 1].each do |size|
+        assert_raises(Dalli::DalliError) { processor.check_value_size!(size) }
+      end
+    end
+  end
+
   describe '#meta_get_with_value' do
     describe 'when key is found (VA response)' do
       it 'returns the unmarshalled value' do
