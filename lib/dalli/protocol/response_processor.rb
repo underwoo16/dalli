@@ -386,7 +386,8 @@ module Dalli
         end
 
         def base64_flag_in_line?(line)
-          line.include?(' b ') || line.end_with?(" b#{TERMINATOR}", ' b')
+          # One scan rules out the common no-b-flag line before the exact checks
+          line.include?(' b') && (line.include?(' b ') || line.end_with?(" b#{TERMINATOR}", ' b'))
         end
 
         # Integer value of the first " <flag><digits>" token at or after start, or 0
