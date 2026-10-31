@@ -540,6 +540,10 @@ describe Dalli::Protocol::Meta::ResponseProcessor do
       assert_equal 'k€y', processor.key_from_va_line("VA 5 f0 k#{b64} b s5\r\n").force_encoding(Encoding::UTF_8)
       assert_equal 'k€y', processor.key_from_va_line("VA 5 f0 k#{b64} s5 b\r\n").force_encoding(Encoding::UTF_8)
       assert_nil processor.key_from_va_line("VA 5 f0 s5\r\n")
+      assert_equal 'bar', processor.key_from_va_line("VA 5 f0 kbar s5\r\n")
+      assert_equal 'b', processor.key_from_va_line("VA 5 f0 kYg== b\r\n")
+      assert_equal 'Yg==', processor.key_from_va_line("VA 5 f0 kYg== s5\r\n")
+      assert_equal 'ab', processor.key_from_va_line("VA 5 f0 kab\r\n")
     end
 
     it 'rejects a pipelined reply that claims an impossible value size' do
