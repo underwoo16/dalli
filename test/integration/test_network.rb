@@ -2,6 +2,123 @@
 
 require_relative '../helper'
 
+# Forwards connections to a real memcached, except that the reply to the
+# first request matching `lose` never arrives: the proxy forwards the request,
+# waits for memcached's reply (so the request has been applied), discards it,
+# holds the connection open for `delay` seconds and then closes it. Requests
+# on later connections are forwarded as is. With drop_first_connection, the
+# first connection is closed as soon as it is accepted, before Dalli has
+# written anything to it.
+class ReplyLosingProxy
+  attr_reader :port
+
+  def initialize(upstream_port, lose: ->(_line) { false }, delay: 0, drop_first_connection: false)
+    @upstream_port = upstream_port
+    @lose = lose
+    @delay = delay
+    @drop_first_connection = drop_first_connection
+    @mutex = Mutex.new
+    @commands = []
+    @lost = false
+    @sockets = []
+    @threads = []
+    @server = TCPServer.new('127.0.0.1', 0)
+    @port = @server.addr[1]
+    @acceptor = Thread.new { accept_connections }
+  end
+
+  # How many requests with this command (such as 'ma') the proxy forwarded
+  def count(command)
+    @mutex.synchronize { @commands.count(command) }
+  end
+
+  def close
+    @server.close
+    @acceptor.kill
+    @mutex.synchronize do
+      @threads.each(&:kill)
+      # A forwarding thread may already have closed its sockets, and
+      # TruffleRuby, unlike CRuby, raises on closing a closed one
+      @sockets.each do |sock|
+        sock.close
+      rescue IOError
+        nil
+      end
+    end
+  end
+
+  private
+
+  def accept_connections
+    drop = @drop_first_connection
+    loop do
+      client = @server.accept
+      if drop
+        drop = false
+        client.close
+        next
+      end
+      @mutex.synchronize { @threads << Thread.new { forward(client) } }
+    end
+  rescue IOError, SystemCallError
+    nil
+  end
+
+  def forward(client)
+    upstream = TCPSocket.new('127.0.0.1', @upstream_port)
+    @mutex.synchronize { @sockets.push(client, upstream) }
+    muted = Queue.new
+    replied = Queue.new
+    pump = Thread.new { pump_replies(upstream, client, muted, replied) }
+    forward_requests(client, upstream, muted, replied)
+  rescue IOError, SystemCallError
+    nil
+  ensure
+    pump&.kill
+    client.close
+    upstream&.close
+  end
+
+  def forward_requests(client, upstream, muted, replied)
+    while (line = client.gets("\r\n"))
+      command, _key, size = line.split
+      data = client.read(size.to_i + 2) if command == 'ms'
+      lose = record(command, line)
+      muted << true if lose
+      upstream.write(line)
+      upstream.write(data) if data
+      next unless lose
+
+      replied.pop(timeout: 5)
+      sleep @delay
+      return
+    end
+  end
+
+  def pump_replies(upstream, client, muted, replied)
+    loop do
+      data = upstream.readpartial(65_536)
+      if muted.empty?
+        client.write(data)
+      else
+        replied << true
+      end
+    end
+  rescue IOError, SystemCallError
+    nil
+  end
+
+  # Returns true for the request whose reply is to be lost
+  def record(command, line)
+    @mutex.synchronize do
+      @commands << command
+      next false if @lost || !@lose.call(line)
+
+      @lost = true
+    end
+  end
+end
+
 describe 'Network' do
   MemcachedManager.supported_protocols.each do |p|
     describe "using the #{p} protocol" do
@@ -13,15 +130,132 @@ describe 'Network' do
           end
         end
 
-        # Only where socket reads time out (CRuby with IO#timeout=). On JRuby,
-        # TruffleRuby or Ruby 3.1, a silent server blocks the read itself
-        # rather than exercising the retries.
-        if RUBY_ENGINE == 'ruby' && IO.method_defined?(:timeout=)
-          # Each retry used to reconnect successfully, which reset the failure
-          # count, so a server that accepts connections but never answers was
-          # retried forever and the caller hung.
-          it 'gives up on a server that accepts connections but never answers' do
-            server = TCPServer.new('127.0.0.1', 19_456)
+        # Each retry used to reconnect successfully, which reset the failure
+        # count, so a server that accepts connections but never answers was
+        # retried forever and the caller hung.
+        it 'gives up on a server that accepts connections but never answers' do
+          server = TCPServer.new('127.0.0.1', 19_456)
+          acceptor = Thread.new do
+            loop do
+              Thread.new(server.accept) do |sock|
+                while (line = sock.gets)
+                  sock.write("VERSION 1.6.45\r\n") if line.start_with?('version')
+                end
+              rescue IOError, SystemCallError
+                nil
+              end
+            end
+          rescue IOError
+            nil
+          end
+          dc = Dalli::Client.new('127.0.0.1:19456', socket_timeout: 0.3, enforce_read_timeout: true,
+                                                    protocol: p)
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+          assert_raises(Dalli::NetworkError) { dc.get('anykey') }
+          assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+        ensure
+          server&.close
+          acceptor&.kill
+        end
+
+        # The quiet writes completed as requests, which reset the failure
+        # count, so the noop's failure was always the first: set_multi and
+        # delete_multi retried forever and the caller hung. One server takes
+        # a different path, so two are used.
+        it 'gives up on multi-writes to a server that drops the connection before replying' do
+          servers = Array.new(2) { TCPServer.new('127.0.0.1', 0) }
+          acceptors = servers.map do |server|
+            Thread.new do
+              loop do
+                Thread.new(server.accept) do |sock|
+                  while (line = sock.gets)
+                    break unless line.start_with?('version')
+
+                    sock.write("VERSION 1.6.45\r\n")
+                  end
+                  sock.close
+                rescue IOError, SystemCallError
+                  nil
+                end
+              end
+            rescue IOError
+              nil
+            end
+          end
+          addresses = servers.map { |s| "127.0.0.1:#{s.addr[1]}" }
+          keys = Array.new(10) { |i| "k#{i}" }
+
+          # With and without failover. Each failure is an immediate EOF, so
+          # nothing here waits for socket_timeout; it's long only so that a
+          # slow version reply on a busy CI runner doesn't fail the connect
+          # and leave every server down before a write is made.
+          clients = Array.new(2) do |i|
+            Dalli::Client.new(addresses, socket_timeout: 2, failover: i.zero?, protocol: p)
+          end
+          clients.each do |dc|
+            [-> { dc.set_multi(keys.to_h { |k| [k, 'v'] }) }, -> { dc.delete_multi(keys) }].each do |call|
+              started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+              assert_raises(Dalli::NetworkError) { call.call }
+              assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+            end
+          end
+        ensure
+          servers&.each(&:close)
+          acceptors&.each(&:kill)
+        end
+
+        # On JRuby and TruffleRuby, these multi-gets hung on a server that
+        # never answers until enforce_read_timeout was added. get_multi_cas,
+        # and get_multi on more than one server, returned {} instead of
+        # raising: the pipelined get dropped a server's keys when it ran out
+        # of time, without counting a failure.
+        it 'gives up on multi-gets from a server that never answers' do
+          servers = [TCPServer.new('127.0.0.1', 19_462), TCPServer.new('127.0.0.1', 0)]
+          acceptors = servers.map do |server|
+            Thread.new do
+              loop do
+                Thread.new(server.accept) do |sock|
+                  while (line = sock.gets)
+                    sock.write("VERSION 1.6.45\r\n") if line.start_with?('version')
+                  end
+                rescue IOError, SystemCallError
+                  nil
+                end
+              end
+            rescue IOError
+              nil
+            end
+          end
+          one = ['127.0.0.1:19462']
+          two = servers.map { |server| "127.0.0.1:#{server.addr[1]}" }
+          calls = [[one, ->(dc) { dc.get_multi('a', 'b') }],
+                   [one, ->(dc) { dc.get_multi_cas('a', 'b') }],
+                   [two, ->(dc) { dc.get_multi(*('a'..'j').to_a) }],
+                   [two, ->(dc) { dc.get_multi(*('a'..'j').to_a) { |_k, _v| nil } }]]
+          calls << [one, ->(dc) { dc.get_multi_with_metadata(%w[a b]) }] if p == :meta
+
+          calls.each do |addresses, call|
+            # A new client each time, since the first failure marks the server down
+            dc = Dalli::Client.new(addresses, socket_timeout: 0.3, enforce_read_timeout: true, protocol: p)
+            started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+            assert_raises(Dalli::NetworkError) { call.call(dc) }
+            assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+          end
+        ensure
+          servers&.each(&:close)
+          acceptors&.each(&:kill)
+        end
+
+        # get_with_metadata requires the meta protocol
+        if p == :meta
+          # get_with_metadata and fetch_with_lock also retried the final
+          # NetworkError raised when the server is marked down, so with
+          # down_retry_delay: 0 they retried the same server forever.
+          it 'gives up in get_with_metadata and fetch_with_lock with down_retry_delay: 0' do
+            server = TCPServer.new('127.0.0.1', 19_457)
             acceptor = Thread.new do
               loop do
                 Thread.new(server.accept) do |sock|
@@ -35,7 +269,43 @@ describe 'Network' do
             rescue IOError
               nil
             end
-            dc = Dalli::Client.new('127.0.0.1:19456', socket_timeout: 0.3, protocol: p)
+            dc = Dalli::Client.new('127.0.0.1:19457', socket_timeout: 0.2, down_retry_delay: 0,
+                                                      enforce_read_timeout: true, protocol: p)
+
+            [-> { dc.get_with_metadata('k') }, -> { dc.fetch_with_lock('k') { 'v' } }].each do |call|
+              started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+              assert_raises(Dalli::NetworkError, Dalli::RingError) { call.call }
+              assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+            end
+          ensure
+            server&.close
+            acceptor&.kill
+          end
+        end
+
+        unless RUBY_ENGINE == 'truffleruby'
+          # With enforce_read_timeout, JRuby times out here too, since it reads
+          # values without blocking. TruffleRuby's read of the value blocks
+          it 'times out on a server that stops partway through a value' do
+            server = TCPServer.new('127.0.0.1', 19_461)
+            acceptor = Thread.new do
+              loop do
+                Thread.new(server.accept) do |sock|
+                  while (line = sock.gets)
+                    if line.start_with?('version') then sock.write("VERSION 1.6.45\r\n")
+                    else sock.write("VA 5 f0\r\nhe")
+                    end
+                  end
+                rescue IOError, SystemCallError
+                  nil
+                end
+              end
+            rescue IOError
+              nil
+            end
+            dc = Dalli::Client.new('127.0.0.1:19461', socket_timeout: 0.3, enforce_read_timeout: true,
+                                                      protocol: p)
             started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
             assert_raises(Dalli::NetworkError) { dc.get('anykey') }
@@ -44,44 +314,11 @@ describe 'Network' do
             server&.close
             acceptor&.kill
           end
-
-          # get_with_metadata requires the meta protocol
-          if p == :meta
-            # get_with_metadata and fetch_with_lock also retried the final
-            # NetworkError raised when the server is marked down, so with
-            # down_retry_delay: 0 they retried the same server forever.
-            it 'gives up in get_with_metadata and fetch_with_lock with down_retry_delay: 0' do
-              server = TCPServer.new('127.0.0.1', 19_457)
-              acceptor = Thread.new do
-                loop do
-                  Thread.new(server.accept) do |sock|
-                    while (line = sock.gets)
-                      sock.write("VERSION 1.6.45\r\n") if line.start_with?('version')
-                    end
-                  rescue IOError, SystemCallError
-                    nil
-                  end
-                end
-              rescue IOError
-                nil
-              end
-              dc = Dalli::Client.new('127.0.0.1:19457', socket_timeout: 0.2, down_retry_delay: 0, protocol: p)
-
-              [-> { dc.get_with_metadata('k') }, -> { dc.fetch_with_lock('k') { 'v' } }].each do |call|
-                started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-                assert_raises(Dalli::NetworkError, Dalli::RingError) { call.call }
-                assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
-              end
-            ensure
-              server&.close
-              acceptor&.kill
-            end
-          end
         end
 
-        # A get_multi that runs out of time overall isn't a socket failure, so
-        # slow ones in a row must not mark the server down.
+        # Each reply arrives within socket_timeout of the last, though all of
+        # them take longer. The wait starts again after each read, so every
+        # key is read, and slow get_multis in a row don't mark the server down.
         it 'keeps a server that answers get_multi slowly' do
           server = TCPServer.new('127.0.0.1', 19_459)
           acceptor = Thread.new do
@@ -97,10 +334,10 @@ describe 'Network' do
                     sock.read(words[2].to_i + 2)
                     sock.write("HD\r\n")
                   when 'mn'
-                    first, *rest = pending
-                    sock.write("VA 1 f0 k#{first} s1\r\nv\r\n")
-                    sleep 0.5 # longer than the client's socket_timeout
-                    rest.each { |k| sock.write("VA 1 f0 k#{k} s1\r\nv\r\n") }
+                    pending.each do |k|
+                      sleep 0.15 # half the client's socket_timeout
+                      sock.write("VA 1 f0 k#{k} s1\r\nv\r\n")
+                    end
                     sock.write("MN\r\n")
                     pending.clear
                   end
@@ -117,13 +354,59 @@ describe 'Network' do
           with_nil_logger do
             3.times do
               yielded = []
+              started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
               dc.get_multi('a', 'b', 'c') { |k, _| yielded << k }
 
-              assert_equal ['a'], yielded
+              assert_equal %w[a b c], yielded
+              assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :>, 0.3
             end
           end
 
           assert dc.set('after', 'ok')
+        ensure
+          server&.close
+          acceptor&.kill
+        end
+
+        # A reply whose declared size is shorter than its value leaves the
+        # CRLF check reading value bytes. Single gets read the value as a miss,
+        # and multi-gets read the rest of the value as the next reply.
+        it 'raises when a reply value is not followed by CRLF' do
+          server = TCPServer.new('127.0.0.1', 19_460)
+          acceptor = Thread.new do
+            loop do
+              Thread.new(server.accept) do |sock|
+                pending = []
+                while (line = sock.gets)
+                  words = line.split
+                  case words.first
+                  when 'version' then sock.write("VERSION 1.6.45\r\n")
+                  when 'mg'
+                    if words.include?('q') then pending << words[1]
+                    else sock.write("VA 2 f0 k#{words[1]} s2\r\nhello\r\n")
+                    end
+                  when 'mn'
+                    pending.each { |k| sock.write("VA 2 f0 k#{k} s2\r\nhello\r\n") }
+                    sock.write("MN\r\n")
+                    pending.clear
+                  end
+                end
+              rescue IOError, SystemCallError
+                nil
+              end
+            end
+          rescue IOError
+            nil
+          end
+          dc = Dalli::Client.new('127.0.0.1:19460', socket_timeout: 0.3, protocol: p)
+
+          with_nil_logger do
+            [-> { dc.get('a', raw: true) },
+             -> { dc.get_multi('a', 'b') },
+             -> { dc.get_multi_with_metadata(%w[a b]) }].each do |call|
+              assert_raises(Dalli::DalliError) { call.call }
+            end
+          end
         ensure
           server&.close
           acceptor&.kill
@@ -796,6 +1079,233 @@ describe 'Network' do
       ensure
         tcp_server.close
         server_thread.kill
+      end
+    end
+  end
+
+  # A request whose reply is lost may still have been applied, so only a
+  # request that is safe to apply twice is sent again. Each case runs with the
+  # reply delayed past socket_timeout and with the connection closed instead.
+  # Where reads don't time out (JRuby, TruffleRuby, Ruby 3.1), the delayed
+  # reply shows up as the connection closing once the delay is over, which
+  # is still a failure after the request was sent.
+  describe 'when a reply is lost after the request was sent' do
+    lost_reply_modes = { 'delayed past socket_timeout' => 0.6, 'cut off by a closed connection' => 0 }
+
+    def with_lost_reply(upstream_port, lose:, delay:, client_options: {}, **proxy_options)
+      proxy = ReplyLosingProxy.new(upstream_port, lose: lose, delay: delay, **proxy_options)
+      dc = Dalli::Client.new("127.0.0.1:#{proxy.port}",
+                             { socket_timeout: 0.2, socket_failure_delay: 0 }.merge(client_options))
+      with_nil_logger { yield dc, proxy }
+    ensure
+      dc&.close
+      proxy&.close
+    end
+
+    def command_named(command)
+      ->(line) { line.split.first == command }
+    end
+
+    def assert_not_retried(&)
+      err = assert_raises(Dalli::NetworkError, &)
+
+      refute_kind_of Dalli::RetryableNetworkError, err
+      assert_match(/may have been applied/, err.message)
+    end
+
+    lost_reply_modes.each do |mode, delay|
+      describe mode do
+        it 'raises from incr instead of applying it twice' do
+          memcached_persistent do |direct, port|
+            key = "incr-#{SecureRandom.hex(4)}"
+            direct.set(key, '10', 0, raw: true)
+
+            with_lost_reply(port, lose: command_named('ma'), delay: delay) do |dc, proxy|
+              assert_not_retried { dc.incr(key, 1) }
+              assert_equal 1, proxy.count('ma')
+            end
+
+            assert_equal '11', direct.get(key, raw: true)
+          end
+        end
+
+        it 'retries get and returns the value' do
+          memcached_persistent do |direct, port|
+            key = "get-#{SecureRandom.hex(4)}"
+            direct.set(key, 'value')
+
+            with_lost_reply(port, lose: command_named('mg'), delay: delay) do |dc, proxy|
+              assert_equal 'value', dc.get(key)
+              assert_equal 2, proxy.count('mg')
+            end
+          end
+        end
+
+        it 'retries a set without a CAS' do
+          memcached_persistent do |direct, port|
+            key = "set-#{SecureRandom.hex(4)}"
+
+            with_lost_reply(port, lose: command_named('ms'), delay: delay) do |dc, proxy|
+              assert op_addset_succeeds(dc.set(key, 'value'))
+              assert_equal 2, proxy.count('ms')
+            end
+
+            assert_equal 'value', direct.get(key)
+          end
+        end
+
+        it 'retries a replace without a CAS' do
+          memcached_persistent do |direct, port|
+            key = "replace-#{SecureRandom.hex(4)}"
+            direct.set(key, 'old')
+
+            with_lost_reply(port, lose: command_named('ms'), delay: delay) do |dc, proxy|
+              assert op_replace_succeeds(dc.replace(key, 'new'))
+              assert_equal 2, proxy.count('ms')
+            end
+
+            assert_equal 'new', direct.get(key)
+          end
+        end
+
+        it 'raises from add instead of returning false for an add that succeeded' do
+          memcached_persistent do |direct, port|
+            key = "add-#{SecureRandom.hex(4)}"
+
+            with_lost_reply(port, lose: command_named('ms'), delay: delay) do |dc, proxy|
+              assert_not_retried { dc.add(key, 'value') }
+              assert_equal 1, proxy.count('ms')
+            end
+
+            assert_equal 'value', direct.get(key)
+          end
+        end
+
+        # Each sends a single request whose reply is lost
+        {
+          'decr' => ['ma', ->(direct, key) { direct.set(key, '19', 0, raw: true) },
+                     ->(dc, key) { dc.decr(key, 1) }, '18'],
+          'append' => ['ms', ->(direct, key) { direct.set(key, 'a', 0, raw: true) },
+                       ->(dc, key) { dc.append(key, 'b') }, 'ab'],
+          'prepend' => ['ms', ->(direct, key) { direct.set(key, 'a', 0, raw: true) },
+                        ->(dc, key) { dc.prepend(key, 'b') }, 'ba'],
+          'set_cas' => ['ms', ->(direct, key) { direct.set(key, 'old', 0, raw: true) },
+                        ->(dc, key) { dc.set_cas(key, 'new', dc.get_cas(key, raw: true).last, 0, raw: true) }, 'new'],
+          'replace_cas' => ['ms', ->(direct, key) { direct.set(key, 'old', 0, raw: true) },
+                            lambda { |dc, key|
+                              dc.replace_cas(key, 'new', dc.get_cas(key, raw: true).last, 0, raw: true)
+                            }, 'new'],
+          'delete_cas' => ['md', ->(direct, key) { direct.set(key, 'old', 0, raw: true) },
+                           ->(dc, key) { dc.delete_cas(key, dc.get_cas(key, raw: true).last) }, nil],
+          'cas' => ['ms', ->(direct, key) { direct.set(key, 'old', 0, raw: true) },
+                    ->(dc, key) { dc.cas(key, 0, raw: true) { 'new' } }, 'new']
+        }.each do |name, (command, setup, call, expected)|
+          it "raises from #{name} instead of retrying it" do
+            memcached_persistent do |direct, port|
+              key = "#{name}-#{SecureRandom.hex(4)}"
+              setup.call(direct, key)
+
+              with_lost_reply(port, lose: command_named(command), delay: delay) do |dc, proxy|
+                assert_not_retried { call.call(dc, key) }
+                assert_equal 1, proxy.count(command)
+              end
+
+              value = direct.get(key, raw: true)
+              expected ? assert_equal(expected, value) : assert_nil(value)
+            end
+          end
+        end
+
+        # A key that needs base64 encoding with an initial value is an incr
+        # that misses, then an add. The add's reply is lost here; sending the
+        # incr again would find the counter and add the amount to it.
+        it 'does not replay an incr with an initial value for a base64-encoded key' do
+          memcached_persistent do |direct, port|
+            key = "counter #{SecureRandom.hex(4)}"
+
+            with_lost_reply(port, lose: command_named('ms'), delay: delay) do |dc, proxy|
+              assert_not_retried { dc.incr(key, 1, 0, 5) }
+              assert_equal 1, proxy.count('ma')
+              assert_equal 1, proxy.count('ms')
+            end
+
+            assert_equal '5', direct.get(key, raw: true)
+          end
+        end
+
+        it 'raises from fetch_with_lock instead of losing the recache race it won' do
+          memcached_persistent do |_direct, port|
+            key = "lock-#{SecureRandom.hex(4)}"
+
+            with_lost_reply(port, lose: command_named('mg'), delay: delay) do |dc, proxy|
+              assert_not_retried { dc.fetch_with_lock(key) { flunk 'the block ran' } }
+              assert_equal 1, proxy.count('mg')
+            end
+          end
+        end
+      end
+    end
+
+    # Connecting happens in Server#alive?, which retries a failed attempt
+    # itself, so these two failures never reach the request
+    it 'retries an incr when the connection closes while connecting' do
+      memcached_persistent do |direct, port|
+        key = "incr-#{SecureRandom.hex(4)}"
+        direct.set(key, '10', 0, raw: true)
+
+        with_lost_reply(port, lose: ->(_line) { false }, delay: 0, drop_first_connection: true) do |dc, proxy|
+          assert_equal 11, dc.incr(key, 1)
+          assert_equal 1, proxy.count('ma')
+        end
+
+        assert_equal '11', direct.get(key, raw: true)
+      end
+    end
+
+    it 'retries an incr when connecting is refused once' do
+      memcached_persistent do |direct, port|
+        key = "incr-#{SecureRandom.hex(4)}"
+        direct.set(key, '10', 0, raw: true)
+        dc = Dalli::Client.new("127.0.0.1:#{port}", socket_failure_delay: 0)
+        attempts = 0
+        open = Dalli::Socket::TCP.method(:open)
+        refuse_once = lambda do |*args|
+          attempts += 1
+          raise Errno::ECONNREFUSED if attempts == 1
+
+          open.call(*args)
+        end
+
+        with_nil_logger do
+          Dalli::Socket::TCP.stub(:open, refuse_once) { assert_equal 11, dc.incr(key, 1) }
+        end
+
+        assert_equal 2, attempts
+        assert_equal '11', direct.get(key, raw: true)
+      ensure
+        dc&.close
+      end
+    end
+
+    # With defer_drain, an earlier quiet block's replies are read with a noop
+    # before the incr is written, so a failure there comes before the incr
+    # was sent
+    it 'retries an incr when draining an earlier quiet block fails' do
+      memcached_persistent do |direct, port|
+        key = "incr-#{SecureRandom.hex(4)}"
+        quiet_key = "quiet-#{SecureRandom.hex(4)}"
+        direct.set(key, '10', 0, raw: true)
+
+        with_lost_reply(port, lose: command_named('mn'), delay: 0, client_options: { defer_drain: true }) do |dc, proxy|
+          dc.quiet { dc.set(quiet_key, 'value') }
+
+          assert_equal 11, dc.incr(key, 1)
+          assert_equal 1, proxy.count('ma')
+          assert_equal 1, proxy.count('ms')
+        end
+
+        assert_equal '11', direct.get(key, raw: true)
+        assert_equal 'value', direct.get(quiet_key)
       end
     end
   end

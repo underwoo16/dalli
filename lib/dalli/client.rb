@@ -69,11 +69,16 @@ module Dalli
     # - :connect_timeout - timeout in seconds for DNS resolution and TCP/UNIX socket connects,
     #                      including reconnects after a failure. Defaults to :socket_timeout.
     #                      TLS handshakes use :socket_timeout.
+    # - :verify_reply_keys - defaults to false. When true, get_multi, get_multi_cas and get_multi_with_metadata only
+    #                        accept replies for the keys they requested; after a reply naming another key, the rest of
+    #                        that server's replies are treated as misses. memcached can name an item by its raw key
+    #                        bytes when the item was created by auto-create from a base64-encoded key, which Dalli no
+    #                        longer does. Costs a multi-get about 15%.
     #
     def initialize(servers = nil, options = {})
       @normalized_servers = ::Dalli::ServersArgNormalizer.normalize_servers(servers)
+      warn_removed_options(options)
       @options = normalize_options(options)
-      warn_removed_options(@options)
       @key_manager = ::Dalli::KeyManager.new(@options)
       @ring = nil
     end
@@ -129,6 +134,10 @@ module Dalli
     #   - :return_last_access [Boolean] return seconds since last access
     #   - :return_ttl_remaining [Boolean] return seconds of TTL remaining (-1 if no TTL)
     #   - :skip_lru_bump [Boolean] don't bump LRU or update access stats
+    #   - :vivify_ttl [Integer] on a miss, create a stub that lives this long
+    #     (sanitized like any other TTL) and report won_recache
+    #   - :recache_ttl [Integer] report won_recache when the item's remaining
+    #     TTL is below this
     #
     # @return [Hash] containing:
     #   - :value - the cached value (or nil on miss)
@@ -155,6 +164,8 @@ module Dalli
     #
     def get_with_metadata(key, options = {})
       validate_routing_tokens!(options)
+      validate_ttl!(:vivify_ttl, options[:vivify_ttl])
+      validate_integer!(:recache_ttl, options[:recache_ttl])
       # A retry re-runs this method with its original arguments, so `key` must
       # stay as the caller gave it; reassigning it would add the namespace again.
       validated_key = @key_manager.validate_key(key.to_s)
@@ -195,11 +206,17 @@ module Dalli
     #
     # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
     #
-    # A transient network error is retried automatically. If a server remains
-    # unreachable after retrying, raises Dalli::NetworkError rather than
-    # silently omitting that server's keys from the result.
+    # A transient network error is retried automatically. If a server stops
+    # during the call and is still unreachable after retrying, raises
+    # Dalli::NetworkError only with `failover: false`; with failover (the
+    # default) its keys go to another server, or are left out when no server
+    # is left. See "Network Errors and Retries" in the README.
     #
-    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    # A retry starts the batch again, so a block can be yielded a key it was
+    # already yielded before the error.
+    #
+    # @raise [Dalli::NetworkError] if a server stops during the call and is
+    #   still unreachable after retrying, without failover
     # rubocop:disable-next Style/ExplicitBlockArgument
     def get_multi(*keys, req_options: nil)
       keys.flatten!
@@ -237,14 +254,18 @@ module Dalli
     #
     # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
     #
-    # A transient network error is retried automatically. If a server remains
-    # unreachable after retrying, raises Dalli::NetworkError rather than
-    # returning its keys as misses or yielding a partial result.
+    # A transient network error is retried automatically. If a server stops
+    # during the call and is still unreachable after retrying, raises
+    # Dalli::NetworkError only with `failover: false`; with failover (the
+    # default) its keys go to another server, or are left out when no server
+    # is left. See "Network Errors and Retries" in the README. The block is
+    # called only once every server has replied, so never twice for a key.
     #
     # @param keys [Array<String>] the keys to fetch
     # @param req_options [Hash, nil] routing-token options
     # @return [Hash] key => { value:, cas:, stale:, miss: }
-    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    # @raise [Dalli::NetworkError] if a server stops during the call and is
+    #   still unreachable after retrying, without failover
     def get_multi_with_metadata(*keys, req_options: nil, &block)
       keys.flatten!
       keys.compact!
@@ -301,6 +322,9 @@ module Dalli
     #   { 'key' => [value, cas_id] }
     #
     # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
+    #
+    # Network errors are handled as in #get_multi, and as there a retry can
+    # yield a key a second time.
     def get_multi_cas(*keys, req_options: nil)
       validate_routing_tokens!(req_options)
 
@@ -323,11 +347,12 @@ module Dalli
     # written to the cache and returned.
     def fetch(key, ttl = nil, req_options = nil)
       req_options = req_options.nil? ? CACHE_NILS : req_options.merge(CACHE_NILS) if cache_nils
+      ttl = ttl_or_default(ttl)
       val = get(key, req_options)
       return val unless block_given? && not_found?(val)
 
       new_val = yield
-      add(key, new_val, ttl_or_default(ttl), req_options)
+      add(key, new_val, ttl, req_options)
       new_val
     end
 
@@ -364,7 +389,10 @@ module Dalli
     def fetch_with_lock(key, ttl: nil, lock_ttl: 30, recache_threshold: nil, req_options: nil, &block)
       raise ArgumentError, 'Block is required for fetch_with_lock' unless block_given?
 
-      validate_integer!(:lock_ttl, lock_ttl)
+      # ttl is only used once the block has run; checked now so a bad one
+      # raises before the lock is taken
+      ttl_or_default(ttl)
+      validate_ttl!(:lock_ttl, lock_ttl)
       validate_integer!(:recache_threshold, recache_threshold)
       validate_routing_tokens!(req_options)
       # Left unchanged for the retry below; see get_with_metadata
@@ -429,6 +457,11 @@ module Dalli
     # the defer_drain option, before the next non-quiet request), and
     # Dalli client methods invoked inside the block will not
     # have return values
+    #
+    # The block is quiet only for the thread or fiber that runs it. Another
+    # thread or fiber sharing this client can make requests meanwhile; a
+    # non-quiet one first sends the block's buffered requests and discards
+    # their replies, so it reads only its own.
     def quiet
       old = Thread.current[::Dalli::QUIET]
       Thread.current[::Dalli::QUIET] = true
@@ -453,8 +486,10 @@ module Dalli
       nil
     end
 
+    # set_cas without its CAS check: the CAS here is always 0
     def set(key, value, ttl = nil, req_options = nil)
-      set_cas(key, value, 0, ttl, req_options)
+      validate_routing_tokens!(req_options)
+      perform(:set, key, value, ttl_or_default(ttl), 0, req_options)
     end
 
     ##
@@ -462,16 +497,20 @@ module Dalli
     # This method is more efficient than calling set() in a loop because
     # it batches requests by server and uses quiet mode.
     #
-    # A transient network error is retried automatically. If a server remains
-    # unreachable after retrying, raises Dalli::NetworkError; keys already
-    # sent to other servers before the error are not rolled back.
+    # A transient network error is retried automatically. If a server stops
+    # during the call and is still unreachable after retrying, raises
+    # Dalli::NetworkError only with `failover: false`; with failover (the
+    # default) its keys go to another server, or are left out when no server
+    # is left. See "Network Errors and Retries" in the README. Keys already
+    # written to other servers before an error are not rolled back.
     #
     # @param hash [Hash] key-value pairs to set
     # @param ttl [Integer] time-to-live in seconds (optional, uses default if not provided)
     # @param req_options [Hash] options passed to each set operation; accepts
     #   :p_token/:l_token, applied to every key in the batch
     # @return [void]
-    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    # @raise [Dalli::NetworkError] if a server stops during the call and is
+    #   still unreachable after retrying, without failover
     #
     # Example:
     #   client.set_multi({ 'key1' => 'value1', 'key2' => 'value2' }, 300)
@@ -492,7 +531,11 @@ module Dalli
     ##
     # Set the key-value pair, verifying existing CAS.
     # Returns the resulting CAS value if succeeded, and falsy otherwise.
+    # The CAS must be an Integer (or a String of decimal digits) between 0 and
+    # 2**64 - 1, or nil; anything else raises ArgumentError. A CAS of 0 or nil
+    # means an unconditional set.
     def set_cas(key, value, cas, ttl = nil, req_options = nil)
+      validate_uint64!(:cas, cas)
       validate_routing_tokens!(req_options)
       perform(:set, key, value, ttl_or_default(ttl), cas, req_options)
     end
@@ -515,18 +558,22 @@ module Dalli
     ##
     # Conditionally add a key/value pair, verifying existing CAS, only if the
     # key already exists on the server.  Returns the new CAS value if the
-    # operation succeeded, or falsy otherwise.
+    # operation succeeded, or falsy otherwise.  The CAS is validated as in
+    # #set_cas.
     def replace_cas(key, value, cas, ttl = nil, req_options = nil)
+      validate_uint64!(:cas, cas)
       validate_routing_tokens!(req_options)
       perform(:replace, key, value, ttl_or_default(ttl), cas, req_options)
     end
 
     # Delete a key/value pair, verifying existing CAS.
     # Returns true if succeeded, and falsy otherwise.
-    # Delete a key, optionally with a CAS check.
+    # Delete a key, optionally with a CAS check.  The CAS is validated as in
+    # #set_cas.
     #
     # `req_options` accepts the same meta-delete options as #delete.
     def delete_cas(key, cas = 0, req_options = nil)
+      validate_uint64!(:cas, cas)
       validate_delete_options!(req_options)
       validate_routing_tokens!(req_options)
       perform(:delete, key, cas, req_options)
@@ -578,9 +625,10 @@ module Dalli
     #   is whichever one the caller asked for. This is best-effort: a transient
     #   network error is retried automatically, and keys handled before the
     #   error are not recounted, so the result may under-report when a retry
-    #   occurs. If a server remains unreachable after retrying, raises
-    #   Dalli::NetworkError.
-    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    #   occurs. A server that stops during the call is handled as in
+    #   #set_multi.
+    # @raise [Dalli::NetworkError] if a server stops during the call and is
+    #   still unreachable after retrying, without failover
     #
     # Example:
     #   client.delete_multi(['key1', 'key2', 'key3'])
@@ -618,9 +666,8 @@ module Dalli
 
     ##
     # Incr adds the given amount to the counter on the memcached server.
-    # Amt must be a positive integer value.
-    # Default, if given, must be an Integer (or a String of decimal digits);
-    # anything else raises ArgumentError.
+    # Amt, and default if given, must be Integers (or Strings of decimal
+    # digits) between 0 and 2**64 - 1; anything else raises ArgumentError.
     #
     # If default is nil, the counter must already exist or the operation
     # will fail and will return nil.  Otherwise this method will return
@@ -632,18 +679,17 @@ module Dalli
     #
     # If the value already exists, it must have been set with raw: true
     def incr(key, amt = 1, ttl = nil, default = nil, req_options = nil)
-      check_positive!(amt)
-      validate_integer!(:default, default)
+      amt = validate_uint64!(:amt, amt)
+      default = validate_uint64!(:default, default)
       validate_routing_tokens!(req_options)
 
-      perform(:incr, key, amt.to_i, ttl_or_default(ttl), default, req_options)
+      perform(:incr, key, amt, ttl_or_default(ttl), default, req_options)
     end
 
     ##
     # Decr subtracts the given amount from the counter on the memcached server.
-    # Amt must be a positive integer value.
-    # Default, if given, must be an Integer (or a String of decimal digits);
-    # anything else raises ArgumentError.
+    # Amt, and default if given, must be Integers (or Strings of decimal
+    # digits) between 0 and 2**64 - 1; anything else raises ArgumentError.
     #
     # memcached counters are unsigned and cannot hold negative values.  Calling
     # decr on a counter which is 0 will just return 0.
@@ -658,20 +704,23 @@ module Dalli
     #
     # If the value already exists, it must have been set with raw: true
     def decr(key, amt = 1, ttl = nil, default = nil, req_options = nil)
-      check_positive!(amt)
-      validate_integer!(:default, default)
+      amt = validate_uint64!(:amt, amt)
+      default = validate_uint64!(:default, default)
       validate_routing_tokens!(req_options)
 
-      perform(:decr, key, amt.to_i, ttl_or_default(ttl), default, req_options)
+      perform(:decr, key, amt, ttl_or_default(ttl), default, req_options)
     end
 
     ##
     # Flush the memcached server, at 'delay' seconds in the future.
     # Delay defaults to zero seconds, which means an immediate flush.
+    # Delay must be a non-negative Integer (or a String of decimal digits);
+    # anything else raises ArgumentError.
     # Every server is attempted. If any of them fails, the first error is
     # raised once all the others have been flushed.
     ##
     def flush(delay = 0)
+      validate_uint64!(:delay, delay)
       first_error = nil
       results = ring.servers.map do |s|
         s.request(:flush, delay)
@@ -764,15 +813,7 @@ module Dalli
 
       raise ArgumentError, 'tombstone_ttl requires invalidate: true' unless req_options[:invalidate]
 
-      # tombstone_kwargs coerces this with Integer(), deep inside the request
-      # path; validated here first so a bad value raises cleanly instead of
-      # unwinding through Protocol::Base#request, which would close the
-      # connection on the ArgumentError Integer() raises.
-      begin
-        Integer(tombstone_ttl)
-      rescue ArgumentError, TypeError
-        raise ArgumentError, "tombstone_ttl must be an integer, got #{tombstone_ttl.inspect}"
-      end
+      validate_ttl!(:tombstone_ttl, tombstone_ttl)
     end
 
     def record_hit_miss_metrics(span, key_count, hit_count)
@@ -808,9 +849,20 @@ module Dalli
       end
     end
 
-    def single_server
+    # retried is true once a request to the server has failed with a
+    # RetryableNetworkError. Without failover, finding the server down then
+    # means that request failed, which raises, rather than the server being
+    # down before the operation began, which returns nil. With failover it
+    # returns nil either way, as the multi-server path leaves keys out when
+    # no server is left.
+    def single_server(retried: false)
       server = ring.servers.first
-      server if server&.alive?
+      return server if server&.alive?
+      if retried && !ring.failover?
+        raise Dalli::NetworkError, "#{server&.name} failed during this request and is still unreachable"
+      end
+
+      nil
     end
 
     # The three single_server_* fast-path methods below share one contract,
@@ -819,55 +871,79 @@ module Dalli
     # socket_max_failures, same as the pipelined path's retry), and a hard
     # NetworkError -- the server genuinely unreachable, not just blipping --
     # propagates to the caller rather than being swallowed into a silently
-    # wrong result. Only server_for_key/single_server finding no live server
-    # to route to at all is still silent, matching Ring#keys_grouped_by_server
-    # dropping a key it can't route on both the single- and multi-server paths.
+    # wrong result, including (without failover) the server going down before
+    # the retry, which single_server raises for. Otherwise finding no live
+    # server is still silent, matching Ring#keys_grouped_by_server dropping a
+    # key it can't route on both the single- and multi-server paths. Each
+    # method sets retried before it retries; a local keeps its value across
+    # a retry.
     def single_server_get_multi(keys, req_options = nil)
-      # A new array, so the retry below starts again from the caller's keys
-      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
-      return {} unless (server = single_server)
+      retried ||= false
+      caller_keys = @key_manager.caller_keys_by_wire_key(keys)
+      return {} unless (server = single_server(retried: retried))
 
-      result = server.request(:read_multi_req, validated_keys, req_options)
-      result.transform_keys! { |k| @key_manager.key_without_namespace(k) }
-      result
+      results_for_caller_keys(server.request(:read_multi_req, caller_keys.keys, req_options), caller_keys)
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
       Dalli.logger.debug { 'retrying single-server get_multi because of network error' }
+      retried = true
       retry
+    rescue Dalli::UnexpectedReplyKeyError => e
+      # The connection is closed and the keys are treated as missing, as the
+      # pipelined get_multi does for a server whose replies are out of step
+      Dalli.logger.warn { e.message }
+      {}
     end
 
     def single_server_get_multi_with_metadata(keys, req_options = nil)
-      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
-      return {} unless (server = single_server)
+      retried ||= false
+      caller_keys = @key_manager.caller_keys_by_wire_key(keys)
+      return {} unless (server = single_server(retried: retried))
 
-      result = server.request(:read_multi_with_metadata_req, validated_keys, req_options)
-      result.transform_keys! { |k| @key_manager.key_without_namespace(k) }
-      result
+      results_for_caller_keys(server.request(:read_multi_with_metadata_req, caller_keys.keys, req_options),
+                              caller_keys)
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
       Dalli.logger.debug { 'retrying single-server get_multi_with_metadata because of network error' }
+      retried = true
       retry
+    rescue Dalli::UnexpectedReplyKeyError => e
+      Dalli.logger.warn { e.message }
+      {}
+    end
+
+    # Replies name the key as sent; returns them under the caller's keys,
+    # skipping any key that wasn't requested
+    def results_for_caller_keys(results, caller_keys)
+      results.each_with_object({}) do |(key, value), hash|
+        caller_key = @key_manager.caller_key(caller_keys, key)
+        hash[caller_key] = value if caller_key
+      end
     end
 
     def single_server_set_multi(hash, ttl, req_options)
+      retried ||= false
       pairs = hash.transform_keys { |k| @key_manager.validate_key(k.to_s) }
-      return unless (server = single_server)
+      return unless (server = single_server(retried: retried))
 
       server.request(:write_multi_req, pairs, ttl, req_options)
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
       Dalli.logger.debug { 'retrying single-server set_multi because of network error' }
+      retried = true
       retry
     end
 
     def single_server_delete_multi(keys, req_options = nil)
+      retried ||= false
       validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
-      return 0 unless (server = single_server)
+      return 0 unless (server = single_server(retried: retried))
 
       server.request(:delete_multi_req, validated_keys, req_options)
     rescue Dalli::RetryableNetworkError => e
       Dalli.logger.debug { e.inspect }
       Dalli.logger.debug { 'retrying single-server delete_multi because of network error' }
+      retried = true
       retry
     end
 
@@ -899,10 +975,6 @@ module Dalli
       attrs
     end
 
-    def check_positive!(amt)
-      raise ArgumentError, "Positive values only: #{amt}" if amt.negative?
-    end
-
     # Numeric arguments that become meta protocol flags (GHSA-6wmv-xq9m-fmp7).
     # RequestFormatter converts them to Integer as the wire-level backstop;
     # checking here too gives the caller a clean ArgumentError for the same
@@ -913,6 +985,27 @@ module Dalli
       value.is_a?(String) ? Integer(value, 10) : Integer(value)
     rescue ArgumentError, TypeError, FloatDomainError
       raise ArgumentError, "#{name} must be an Integer, got #{value.inspect}"
+    end
+
+    MAX_UINT64 = (2**64) - 1
+    private_constant :MAX_UINT64
+
+    # CAS values, incr/decr amounts and initial values, and the flush delay
+    # are read by memcached as unsigned 64-bit integers. RequestFormatter
+    # raises on anything else as the wire-level backstop; checking here first
+    # keeps the connection open, for the reason given for routing tokens
+    # below. Accepts an Integer or a String of decimal digits, and returns it
+    # as an Integer.
+    def validate_uint64!(name, value)
+      return if value.nil?
+
+      int = case value
+            when Integer then value
+            when String then Integer(value, 10, exception: false)
+            end
+      return int if int && int >= 0 && int <= MAX_UINT64
+
+      raise ArgumentError, "#{name} must be an Integer between 0 and #{MAX_UINT64}, got #{value.inspect}"
     end
 
     # Validated here, before the request reaches Protocol::Base#request, rather
@@ -943,15 +1036,16 @@ module Dalli
 
     def cas_core(key, always_set, ttl = nil, req_options = nil)
       validate_routing_tokens!(req_options)
+      ttl = ttl_or_default(ttl)
       (value, cas) = perform(:cas, key, req_options)
       return if !always_set && cas_miss?(value, cas)
 
       newvalue = yield(value)
       # A CAS of 0 means the key was missing. A set with CAS 0 is unconditional,
       # so add instead: it fails if another client created the key meanwhile.
-      return perform(:add, key, newvalue, ttl_or_default(ttl), req_options) if cas.zero?
+      return perform(:add, key, newvalue, ttl, req_options) if cas.zero?
 
-      perform(:set, key, newvalue, ttl_or_default(ttl), cas, req_options)
+      perform(:set, key, newvalue, ttl, cas, req_options)
     end
 
     # The CAS lookup returns [nil, 0] on a miss rather than NOT_FOUND, and a
@@ -980,12 +1074,47 @@ module Dalli
 
     ##
     # Uses the argument TTL or the client-wide default.  Ensures
-    # that the value is an integer
+    # that the value is an integer memcached accepts as an expiration
     ##
     def ttl_or_default(ttl)
-      (ttl || @options[:expires_in]).to_i
-    rescue NoMethodError
-      raise ArgumentError, "Cannot convert ttl (#{ttl}) to an integer"
+      ttl ||= @options[:expires_in] || 0
+      # validate_ttl!'s fast path, without the call
+      return ttl if ttl.is_a?(Integer) && ttl >= Protocol::TtlSanitizer::MIN_EXPIRATION_TIME &&
+                    ttl <= Protocol::TtlSanitizer::MAX_ACCEPTABLE_EXPIRATION_INTERVAL
+
+      validate_ttl!(:ttl, ttl)
+    end
+
+    # Returns the TTL as an Integer, sanitized (see TtlSanitizer), raising
+    # ArgumentError unless memcached can use it. An interval over 30 days comes
+    # back as the Unix time it becomes, so the request path doesn't convert it
+    # again. A String must be a whole number in decimal, as for the other
+    # numeric arguments; anything else is converted with to_i, so a Float or
+    # an ActiveSupport::Duration still works. Once sanitized it must fit memcached's signed 32-bit expiration time. A
+    # negative TTL is allowed: memcached stores the item as already expired.
+    # memcached rejects a TTL outside that with CLIENT_ERROR, which a quiet
+    # block or set_multi silently discards, so it is checked here, before the
+    # request is written.
+    def validate_ttl!(name, value)
+      return if value.nil?
+      # The usual case: an Integer TTL that TtlSanitizer leaves unchanged
+      return value if value.is_a?(Integer) && value >= Protocol::TtlSanitizer::MIN_EXPIRATION_TIME &&
+                      value <= Protocol::TtlSanitizer::MAX_ACCEPTABLE_EXPIRATION_INTERVAL
+
+      ttl = ttl_to_i(name, value)
+      min = Protocol::TtlSanitizer::MIN_EXPIRATION_TIME
+      max = Protocol::TtlSanitizer::MAX_EXPIRATION_TIME
+      ttl = Protocol::TtlSanitizer.sanitize(ttl)
+      return ttl if ttl.between?(min, max)
+
+      raise ArgumentError, "#{name} must be a number of seconds no smaller than #{min} or a Unix time " \
+                           "no later than #{max}, got #{value.inspect}"
+    end
+
+    def ttl_to_i(name, value)
+      value.is_a?(String) ? Integer(value, 10) : value.to_i
+    rescue ArgumentError, NoMethodError, FloatDomainError
+      raise ArgumentError, "#{name} must be an Integer, got #{value.inspect}"
     end
 
     def ring
@@ -1000,7 +1129,10 @@ module Dalli
     #
     # This method also forces retries on network errors - when
     # a particular memcached instance becomes unreachable, or the
-    # operation times out.
+    # operation times out. Once some of the request has been sent, only
+    # one that is safe to apply twice is retried; for the others
+    # (incr, decr, append, prepend, add, replace and CAS writes)
+    # Protocol::Base#request raises a NetworkError, which isn't retried.
     ##
     # rubocop:disable Naming/MethodParameterName
     def perform(op, key, ...)
@@ -1029,13 +1161,12 @@ module Dalli
     end
 
     # Works on a copy so the caller's hash is neither modified here nor able
-    # to change this client's configuration later.
+    # to change this client's configuration later. Credentials are dropped:
+    # Dalli 5 doesn't use them, and kept they could show up in #inspect.
     def normalize_options(options)
-      opts = options.dup
-      opts[:expires_in] = opts[:expires_in].to_i if opts[:expires_in]
+      opts = options.except(:username, :password)
+      opts[:expires_in] = ttl_to_i(:expires_in, opts[:expires_in]) if opts[:expires_in]
       opts
-    rescue NoMethodError
-      raise ArgumentError, "cannot convert :expires_in => #{opts[:expires_in].inspect} to an integer"
     end
 
     REMOVED_OPTIONS = {

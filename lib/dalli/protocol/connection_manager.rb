@@ -21,11 +21,17 @@ module Dalli
         # amount of time to sleep between retries when a failure occurs
         socket_failure_delay: 0.1,
         # Set keepalive
-        keepalive: true
+        keepalive: true,
+        # On JRuby and TruffleRuby, time out reads after socket_timeout (see
+        # ReadTimeout). CRuby always does.
+        enforce_read_timeout: false
       }.freeze
 
       attr_accessor :hostname, :port, :socket_type, :options
       attr_reader :sock
+      # The buffer replies are read into (see Base#response_buffer). It's
+      # cleared with the write buffer whenever the connection closes.
+      attr_writer :response_buffer
 
       def initialize(hostname, port, socket_type, client_options)
         @hostname = hostname
@@ -33,14 +39,17 @@ module Dalli
         @socket_type = socket_type
         @options = DEFAULTS.merge(client_options)
         @request_in_progress = false
+        @request_sent = false
         @quiet_responses_pending = false
         @sock = nil
         @pid = nil
         @write_buffer = []
         @write_buffer_bytes = 0
+        @response_buffer = nil
 
         @fail_count = 0
         reset_down_info
+        extend ReadTimeout if @options[:enforce_read_timeout] && RUBY_ENGINE != 'ruby'
       end
 
       def name
@@ -60,6 +69,7 @@ module Dalli
         @pid = Process.pid
         @request_in_progress = false
         @quiet_responses_pending = false
+        @last_used_at = Process.clock_gettime(Process::CLOCK_MONOTONIC, :millisecond)
       rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError, SocketError => e
         # SocketError = DNS resolution failure; SSL_ERRORS = failed TLS handshake
         error_on_request!(e)
@@ -105,9 +115,46 @@ module Dalli
         @socket_timeout ||= @options[:socket_timeout]
       end
 
+      # Before a request: closes a connection left mid-request, reconnects
+      # after a fork, and checks a connection that sat idle (see
+      # #close_if_closed_by_peer!). Idle time runs from the start of the last
+      # request, so the clock is read once per request; after a request that
+      # itself took over a second, the next just makes a check that finds
+      # nothing. Pending quiet replies are readable and expected, so the
+      # check, and the clock read, are skipped while there are any; in a quiet
+      # block that is every write after the first.
       def confirm_ready!
         close if request_in_progress?
         reconnect_on_fork if fork_detected?
+        return if @sock.nil? || @quiet_responses_pending
+
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :millisecond)
+        idle = now - @last_used_at
+        @last_used_at = now
+        close_if_closed_by_peer! if idle >= IDLE_CHECK_MS
+      end
+
+      # How long, in milliseconds, a connection goes without a request before
+      # the next one first checks that the server hasn't closed it. Integer
+      # milliseconds keep Float arithmetic off the request path.
+      IDLE_CHECK_MS = 1000
+
+      # memcached's idle_timeout, a load balancer or a firewall can close a
+      # connection that sat unused. The next write still succeeds, into the
+      # kernel's buffer, and only the read fails, by which time the request
+      # counts as sent: one that isn't safe to send twice, such as an incr or
+      # an add, then raises instead of being retried. With no replies pending,
+      # an idle connection has nothing to read, so a readable one was closed
+      # by the other end (or holds bytes nothing asked for). Closing it here
+      # lets the request go out on a new connection. A connection dropped
+      # without the other end being told can't be detected this way.
+      def close_if_closed_by_peer!
+        return unless @sock.to_io.wait_readable(0)
+
+        Dalli.logger.debug { "#{name} closed the connection while it was idle; reconnecting" }
+        close
+      rescue IOError, SystemCallError
+        close
       end
 
       def confirm_in_progress!
@@ -133,6 +180,7 @@ module Dalli
           @pid = nil
           @quiet_responses_pending = false
           discard_write_buffer
+          @response_buffer&.clear
           abort_request!
         end
       end
@@ -171,12 +219,14 @@ module Dalli
         raise '[Dalli] Request already in progress. This may be a bug in Dalli.' if @request_in_progress
 
         @request_in_progress = true
+        @request_sent = false
       end
 
       def finish_request!
         raise '[Dalli] No request in progress. This may be a bug in Dalli.' unless @request_in_progress
 
         @request_in_progress = false
+        @request_sent = false
         # A completed request is what proves the server healthy again, so the
         # failure count resets here rather than on reconnect: a server that
         # accepts connections but never answers would otherwise reset it on
@@ -184,8 +234,26 @@ module Dalli
         @fail_count = 0
       end
 
+      # Ends a request whose reply isn't read with it: a quiet write, or one of
+      # set_multi's or delete_multi's writes. The server hasn't answered, so the
+      # failure count stays; the noop that reads the replies resets it.
+      def finish_unanswered_request!
+        raise '[Dalli] No request in progress. This may be a bug in Dalli.' unless @request_in_progress
+
+        @request_in_progress = false
+        @request_sent = false
+      end
+
       def abort_request!
         @request_in_progress = false
+        @request_sent = false
+      end
+
+      # True once any of the request in progress has been handed to the
+      # socket. Writes made outside a request (the version check on connect,
+      # draining an earlier quiet block's replies) don't count.
+      def request_sent?
+        @request_sent
       end
 
       # The longest reply line Dalli reads, in bytes, CRLF included. A meta
@@ -301,9 +369,11 @@ module Dalli
       end
 
       def reconnect!(message)
+        # Read before close, which ends the request
+        request_sent = @request_sent
         close
         sleep(options[:socket_failure_delay]) if options[:socket_failure_delay]
-        raise Dalli::RetryableNetworkError, message
+        raise Dalli::RetryableNetworkError.new(message, request_sent: request_sent)
       end
 
       # Called on connect. Deliberately leaves @fail_count alone; see
@@ -370,6 +440,8 @@ module Dalli
       def flush_write_buffer
         return if @write_buffer.empty?
 
+        # Set before writing: a write that fails may still have sent some bytes
+        @request_sent = true if @request_in_progress
         @sock.write(@write_buffer.size == 1 ? @write_buffer.first : joined_write_buffer)
         discard_write_buffer
       end
@@ -407,6 +479,43 @@ module Dalli
         return buffer if buffer && buffer.bytesize == count
 
         raise EOFError, "EOF reading #{count} bytes; received #{buffer ? buffer.bytesize : 0}"
+      end
+
+      # CRuby enforces socket_timeout on reads through IO#timeout=. TruffleRuby
+      # has no IO#timeout=, and JRuby (as of 10.1) defines it but doesn't
+      # enforce it; both ignore the SO_RCVTIMEO fallback, so a read from a
+      # server that stopped answering blocks forever. With
+      # enforce_read_timeout, the first read after a request is sent waits for
+      # the socket to be readable, up to socket_timeout. It's opt-in because
+      # the wait costs about 8% of single-key throughput on TruffleRuby and
+      # 20-29% on JRuby. A server that stops partway through a reply line can
+      # still block. So can one that stops partway through a value on
+      # TruffleRuby; JRuby reads values without blocking.
+      #
+      # TLS connections are left as they were: OpenSSL buffers decrypted
+      # bytes that wait_readable can't see.
+      module ReadTimeout
+        def read_line
+          flush_write_buffer
+          if @awaiting_reply
+            @awaiting_reply = false
+            wait_readable! unless @sock.is_a?(::OpenSSL::SSL::SSLSocket)
+          end
+          super
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          error_on_request!(e)
+        end
+
+        private
+
+        def flush_write_buffer
+          @awaiting_reply = true unless @write_buffer.empty?
+          super
+        end
+
+        def wait_readable!
+          @sock.wait_readable(socket_timeout) or raise Timeout::Error, "IO timeout reading from #{name}"
+        end
       end
     end
   end

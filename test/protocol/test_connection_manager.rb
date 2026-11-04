@@ -54,6 +54,13 @@ describe Dalli::Protocol::ConnectionManager do
       assert_equal 5, cm.options[:socket_timeout]
       assert_equal 2, cm.options[:socket_max_failures] # default preserved
     end
+
+    it 'waits for replies only with enforce_read_timeout, and never on CRuby' do
+      opted_in = Dalli::Protocol::ConnectionManager.new(hostname, port, socket_type, enforce_read_timeout: true)
+
+      refute_kind_of Dalli::Protocol::ConnectionManager::ReadTimeout, connection_manager
+      assert_equal RUBY_ENGINE != 'ruby', opted_in.is_a?(Dalli::Protocol::ConnectionManager::ReadTimeout)
+    end
   end
 
   describe '#name' do
@@ -192,6 +199,66 @@ describe Dalli::Protocol::ConnectionManager do
     end
   end
 
+  describe '#request_sent?' do
+    let(:manager) do
+      Dalli::Protocol::ConnectionManager.new('localhost', 11_211, :tcp, { socket_failure_delay: 0 }).tap do |m|
+        m.instance_variable_set(:@sock, sock)
+      end
+    end
+    # Accepts writes; every read hits EOF
+    let(:sock) do
+      Class.new do
+        def write(bytes) = bytes.bytesize
+        def gets(*) = nil
+        def close; end
+      end.new
+    end
+
+    it 'is false until the request in progress writes to the socket' do
+      manager.start_request!
+      manager.write("mn\r\n")
+
+      refute_predicate manager, :request_sent?
+
+      manager.flush
+
+      assert_predicate manager, :request_sent?
+    end
+
+    it 'is reset when a request starts or finishes' do
+      manager.start_request!
+      manager.flushed_write("mn\r\n")
+      manager.finish_request!
+
+      refute_predicate manager, :request_sent?
+
+      manager.start_request!
+
+      refute_predicate manager, :request_sent?
+    end
+
+    it 'ignores writes made outside a request' do
+      manager.flushed_write("version\r\n")
+
+      refute_predicate manager, :request_sent?
+      err = assert_raises(Dalli::RetryableNetworkError) { manager.read_line }
+      refute_predicate err, :request_sent?
+    end
+
+    it 'is carried by the error raised for a failed request' do
+      manager.start_request!
+      manager.flushed_write("mn\r\n")
+
+      err = assert_raises(Dalli::RetryableNetworkError) { manager.read_line }
+      assert_predicate err, :request_sent?
+      refute_predicate manager, :request_sent?
+    end
+
+    it 'defaults to false on an error raised without it' do
+      refute_predicate Dalli::RetryableNetworkError.new('transient'), :request_sent?
+    end
+  end
+
   describe '#request_in_progress?' do
     it 'returns false initially' do
       refute_predicate connection_manager, :request_in_progress?
@@ -240,6 +307,33 @@ describe Dalli::Protocol::ConnectionManager do
     it 'raises when no request in progress' do
       error = assert_raises(RuntimeError) do
         connection_manager.finish_request!
+      end
+
+      assert_match(/No request in progress/, error.message)
+    end
+
+    it 'resets the failure count' do
+      connection_manager.instance_variable_set(:@fail_count, 1)
+      connection_manager.start_request!
+      connection_manager.finish_request!
+
+      assert_equal 0, connection_manager.instance_variable_get(:@fail_count)
+    end
+  end
+
+  describe '#finish_unanswered_request!' do
+    it 'ends the request and keeps the failure count' do
+      connection_manager.instance_variable_set(:@fail_count, 1)
+      connection_manager.start_request!
+      connection_manager.finish_unanswered_request!
+
+      refute_predicate connection_manager, :request_in_progress?
+      assert_equal 1, connection_manager.instance_variable_get(:@fail_count)
+    end
+
+    it 'raises when no request in progress' do
+      error = assert_raises(RuntimeError) do
+        connection_manager.finish_unanswered_request!
       end
 
       assert_match(/No request in progress/, error.message)

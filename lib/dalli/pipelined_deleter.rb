@@ -7,6 +7,8 @@ module Dalli
   # and using quiet mode to minimize round trips.
   ##
   class PipelinedDeleter
+    include KeyGrouping
+
     def initialize(ring, key_manager)
       @ring = ring
       @key_manager = key_manager
@@ -25,8 +27,9 @@ module Dalli
     #   tombstoned rather than removed. This is best-effort: a transient
     #   network error is retried automatically, and keys handled before the
     #   error are not recounted, so the result may under-report when a retry
-    #   occurs. If a server remains unreachable after retrying, raises
-    #   Dalli::NetworkError.
+    #   occurs. If a server stops during the call and is still unreachable
+    #   after retrying, raises Dalli::NetworkError without failover (see
+    #   KeyGrouping).
     ##
     def process(keys, req_options = nil)
       return 0 if keys.empty?
@@ -44,7 +47,8 @@ module Dalli
     private
 
     def setup_requests(keys, req_options = nil)
-      groups = groups_for_keys(keys)
+      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
+      groups = groups_for_keys(validated_keys, 'delete')
       make_delete_requests(groups, req_options)
       groups
     end
@@ -88,19 +92,6 @@ module Dalli
         Dalli.logger.debug { "unable to complete pipelined delete on server #{server.name}" }
         0
       end
-    end
-
-    def groups_for_keys(keys)
-      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
-      groups = @ring.keys_grouped_by_server(validated_keys)
-
-      if (unfound_keys = groups.delete(nil))
-        Dalli.logger.debug do
-          "unable to delete #{unfound_keys.length} keys because no matching server was found"
-        end
-      end
-
-      groups
     end
   end
 end

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'helper'
+require 'open3'
 
 describe 'Dalli::Socket::TCP' do
   describe '.supports_connect_timeout?' do
@@ -192,6 +193,35 @@ describe 'Dalli::Socket::TCP' do
       end
     end
   end
+
+  # TruffleRuby doesn't set close-on-exec on sockets, so a process spawned
+  # while a connection was open inherited it
+  describe 'close-on-exec' do
+    it 'is set on a TCP socket' do
+      server = TCPServer.new('127.0.0.1', 0)
+      sock = Dalli::Socket::TCP.open('127.0.0.1', server.addr[1], socket_timeout: 1)
+
+      assert_predicate sock, :close_on_exec?
+    ensure
+      sock&.close
+      server&.close
+    end
+
+    it 'is set on a UNIX socket' do
+      skip 'UNIX sockets unsupported on Windows' if RbConfig::CONFIG['host_os'].match?(/mingw|mswin/)
+
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, 'dalli.sock')
+        server = UNIXServer.new(path)
+        sock = Dalli::Socket::UNIX.open(path, socket_timeout: 1)
+
+        assert_predicate sock, :close_on_exec?
+      ensure
+        sock&.close
+        server&.close
+      end
+    end
+  end
 end
 
 describe 'Dalli::Socket::InstanceMethods#read_available' do
@@ -276,6 +306,18 @@ describe 'Dalli::Socket::SSLSocket#read_available' do
   end
 end
 
+describe 'Dalli::Protocol::SSL_ERRORS' do
+  # The suite loads openssl before Dalli, so check a process that requires only dalli
+  it 'includes OpenSSL::SSL::SSLError when dalli is required on its own' do
+    lib = File.expand_path('../lib', __dir__)
+    out, status = Open3.capture2(RbConfig.ruby, '-I', lib, '-e',
+                                 'require "dalli"; print Dalli::Protocol::SSL_ERRORS.inspect')
+
+    assert_predicate status, :success?
+    assert_equal '[OpenSSL::SSL::SSLError]', out
+  end
+end
+
 describe 'Dalli::Socket::TCP TLS handshake' do
   # A plain TCP server that answers every connection with a non-TLS reply and
   # hangs up, so the client's TLS handshake fails
@@ -303,6 +345,12 @@ describe 'Dalli::Socket::TCP TLS handshake' do
     ctx
   end
 
+  def attempt_garbage_handshake(port)
+    assert_raises(OpenSSL::SSL::SSLError, Errno::ECONNRESET, EOFError) do
+      Dalli::Socket::TCP.open('127.0.0.1', port, socket_timeout: 1, ssl_context: unverified_context)
+    end
+  end
+
   def open_fds
     Dir.children('/dev/fd').size
   end
@@ -314,12 +362,13 @@ describe 'Dalli::Socket::TCP TLS handshake' do
       with_garbage_server do |port|
         # Without GC, a socket that isn't closed explicitly stays open
         GC.disable
+        # One attempt before counting: JRuby opens its selector's descriptors
+        # on first use, which would otherwise count as three leaked sockets
+        attempt_garbage_handshake(port)
         before = open_fds
 
         20.times do
-          assert_raises(OpenSSL::SSL::SSLError, Errno::ECONNRESET, EOFError) do
-            Dalli::Socket::TCP.open('127.0.0.1', port, socket_timeout: 1, ssl_context: unverified_context)
-          end
+          attempt_garbage_handshake(port)
         end
 
         # Allows for the server's side of the last connection still being open

@@ -30,11 +30,13 @@ someone else does, and to harden the project around them.
 - [x] **`SECURITY.md`:** which release lines get security fixes, and how to
       report a vulnerability (GitHub private vulnerability reporting is
       already enabled). (#1190)
-- [ ] **Gem publishing:** consider RubyGems trusted publishing from CI, so
+- [x] **Gem publishing:** considered RubyGems trusted publishing from CI, so
       released gems are built from tagged commits rather than on a local
-      machine. MFA is already required (`rubygems_mfa_required`).
-- [ ] **OpenSSF Scorecard** (optional): a workflow that keeps checking the
-      items above.
+      machine. Not adopted: gems are pushed by hand, with MFA required
+      (`rubygems_mfa_required`), and each release's published checksum is
+      checked against the gem built from its tag.
+- [x] **OpenSSF Scorecard:** a workflow that keeps checking the items above
+      (`.github/workflows/scorecard.yml`, #1283). The first run scored 7.8.
 
 ## 2. Code audit, by attack surface
 
@@ -57,6 +59,20 @@ advisories. Five were fixed together in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12:
 - [GHSA-w39f-xq2m-4g8x](https://github.com/petergoldstein/dalli/security/advisories/GHSA-w39f-xq2m-4g8x):
   a forked child could resend the parent's buffered requests or end its TLS
   session.
+
+Three more were fixed in later coordinated releases:
+
+- [GHSA-m252-9cgf-vx2w](https://github.com/petergoldstein/dalli/security/advisories/GHSA-m252-9cgf-vx2w)
+  (5.2.2, 5.1.4, 5.0.10 and 4.3.7): with a namespace, a retried request read
+  or wrote a different key.
+- [GHSA-r47x-6p6r-mvcp](https://github.com/petergoldstein/dalli/security/advisories/GHSA-r47x-6p6r-mvcp)
+  (5.2.3, 5.1.5, 5.0.11, 4.3.8 and 3.2.14): counters that `incr` or `decr`
+  auto-created for base64-encoded keys could forge `get_multi` replies.
+- [GHSA-5xvx-r8rg-5qm2](https://github.com/petergoldstein/dalli/security/advisories/GHSA-5xvx-r8rg-5qm2)
+  (5.2.4, 5.1.6, 5.0.12, 4.3.9 and 3.2.15): a `quiet` block on a shared
+  client, a `get_multi` that stopped early, or (3.2, meta protocol) a value
+  containing CR/LF could put a connection out of step and return another
+  key's value.
 
 - [x] **Request building:** every value that reaches a command line (keys,
       namespaces including namespace procs, routing tokens, numeric flags,
@@ -86,12 +102,12 @@ Lower-risk improvements the audit turned up, to be done in the open:
 - [ ] **Credentials:** stop keeping usernames and passwords from server URIs
       and options (Dalli 5 doesn't use them), so `#inspect` and error messages
       can't show them.
-- [ ] **`Rack::Session::Dalli`:** document that sessions never expire in
+- [x] **`Rack::Session::Dalli`:** document that sessions never expire in
       memcached unless `expire_after` is set, and handle a session value that
       can't be decoded without locking the user out.
-- [ ] **Value terminator:** check the `\r\n` after each value instead of
+- [x] **Value terminator:** check the `\r\n` after each value instead of
       trusting the declared size.
-- [ ] **Encodings:** raw and `append` values in encodings that aren't ASCII
+- [x] **Encodings:** raw and `append` values in encodings that aren't ASCII
       compatible raise `Encoding::CompatibilityError`.
 - [ ] **Docs:** a `get_multi` block can see a key twice when a network error
       makes Dalli retry.
@@ -109,11 +125,16 @@ Lower-risk improvements the audit turned up, to be done in the open:
       parser in random-sized chunks, and each hit is also parsed by the
       single-key parser. Both must return exactly the generated keys and
       values (`test/protocol/test_response_processor_fuzz.rb`).
+- [x] **Coverage-guided fuzzing of the reply parsers:** malformed replies,
+      fed to the single-request and pipelined parsers with Ruzzy and
+      ClusterFuzzLite, must raise nothing but `Dalli::DalliError` (`fuzz/`,
+      `.github/workflows/fuzzing.yml`). Runs on pull requests that change
+      `lib/` and weekly.
 
 ## 4. Ongoing process
 
-- [ ] Document the advisory process used for GHSA-6wmv-xq9m-fmp7 and the
+- [x] Document the advisory process used for GHSA-6wmv-xq9m-fmp7 and the
       five advisories above: temporary private fork, backports to each
       supported line, release PRs once fixes are ready to ship, releases in
-      sequence, then publication.
+      sequence, then publication. See [advisory-process.md](advisory-process.md).
 - [ ] Repeat the section 2 audit whenever a protocol feature is added.

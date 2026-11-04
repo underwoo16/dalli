@@ -7,6 +7,8 @@ module Dalli
   # and using quiet mode to minimize round trips.
   ##
   class PipelinedSetter
+    include KeyGrouping
+
     def initialize(ring, key_manager)
       @ring = ring
       @key_manager = key_manager
@@ -15,8 +17,9 @@ module Dalli
     ##
     # Writes multiple key-value pairs to memcached.
     #
-    # A transient network error is retried automatically. If a server remains
-    # unreachable after retrying, raises Dalli::NetworkError.
+    # A transient network error is retried automatically. If a server stops
+    # during the call and is still unreachable after retrying, raises
+    # Dalli::NetworkError without failover (see KeyGrouping).
     #
     # A value that can't be marshalled or is over value_max_bytes is skipped;
     # the other keys are still stored, then the first such error is raised.
@@ -43,9 +46,12 @@ module Dalli
 
     private
 
+    # Values are looked up by each key as sent. The caller's key can't be
+    # rebuilt from it: a long key is digested, and a Symbol becomes a String.
     def setup_requests(hash, ttl, req_options)
-      groups = groups_for_keys(hash.keys)
-      make_set_requests(groups, hash, ttl, req_options)
+      pairs = hash.transform_keys { |k| @key_manager.validate_key(k.to_s) }
+      groups = groups_for_keys(pairs.keys, 'set')
+      make_set_requests(groups, pairs, ttl, req_options)
       groups.keys
     end
 
@@ -59,12 +65,10 @@ module Dalli
     # RetryableNetworkError too -- since NetworkError < DalliError -- dropping
     # this server's keys on a transient hiccup instead of retrying. Only a
     # non-network DalliError should be swallowed here.
-    def make_set_requests(groups, hash, ttl, req_options)
+    def make_set_requests(groups, pairs, ttl, req_options)
       groups.each do |server, keys_for_server|
         keys_for_server.each do |key|
-          original_key = @key_manager.key_without_namespace(key)
-          value = hash[original_key]
-          server.request(:pipelined_set, key, value, ttl, req_options)
+          server.request(:pipelined_set, key, pairs[key], ttl, req_options)
         rescue Dalli::NetworkError
           raise
         rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
@@ -90,19 +94,6 @@ module Dalli
         Dalli.logger.debug { e.inspect }
         Dalli.logger.debug { "unable to complete pipelined set on server #{server.name}" }
       end
-    end
-
-    def groups_for_keys(keys)
-      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
-      groups = @ring.keys_grouped_by_server(validated_keys)
-
-      if (unfound_keys = groups.delete(nil))
-        Dalli.logger.debug do
-          "unable to set #{unfound_keys.length} keys because no matching server was found"
-        end
-      end
-
-      groups
     end
   end
 end

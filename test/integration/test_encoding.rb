@@ -60,6 +60,84 @@ describe 'Encoding' do
           assert_equal 'plain_value', dc.get(plain_key)
         end
       end
+
+      # A base64-encoded reply key is decoded as UTF-8, so a binary key used
+      # to come back as a UTF-8 String that isn't a key of the result's
+      Minitest::Spec::MULTI_GETS.each do |name, multi_get|
+        it "#{name} returns binary and Unicode keys with the caller's encoding" do
+          with_one_and_two_servers(p) do |dc|
+            expected = { "\xff".b => 1, "caf\xe9".b => 2, 'café' => 3, 'é' * 130 => 4, 'ascii'.b => 5 }
+            expected.each { |k, v| dc.set(k, v) }
+
+            assert_caller_keys expected, multi_get.call(dc, expected.keys)
+          end
+        end
+      end
+
+      # memcached stores bytes, so a raw value in an encoding that isn't
+      # ASCII-compatible is stored as its bytes rather than raising
+      # Encoding::CompatibilityError
+      it 'stores raw UTF-16 values as their bytes' do
+        memcached_persistent(p) do |dc|
+          utf16 = 'hé'.encode('UTF-16LE')
+
+          assert dc.set('utf16', utf16, 0, raw: true)
+          assert_equal utf16.b, dc.get('utf16', raw: true).b
+
+          dc.quiet { dc.set('quiet_utf16', utf16, 0, raw: true) }
+
+          assert_equal utf16.b, dc.get('quiet_utf16', raw: true).b
+        end
+      end
+
+      # The encoding error used to close the connection, dropping the quiet
+      # writes buffered before it
+      it 'keeps earlier quiet writes when a later value is UTF-16' do
+        memcached_persistent(p) do |dc|
+          dc.quiet do
+            dc.set('before', '1', 0, raw: true)
+            dc.set('utf16', 'x'.encode('UTF-16LE'), 0, raw: true)
+            dc.set('after', '3', 0, raw: true)
+          end
+
+          assert_equal '1', dc.get('before', raw: true)
+          assert_equal 'x'.encode('UTF-16LE').b, dc.get('utf16', raw: true).b
+          assert_equal '3', dc.get('after', raw: true)
+        end
+      end
+
+      it 'appends and prepends UTF-16 values as their bytes' do
+        memcached_persistent(p) do |dc|
+          dc.set('k', 'x', 0, raw: true)
+
+          assert dc.append('k', 'a'.encode('UTF-16LE'))
+          assert dc.prepend('k', 'p'.encode('UTF-32LE'))
+          assert_equal "p\0\0\0xa\0".b, dc.get('k', raw: true).b
+        end
+      end
+
+      it 'writes binary values with a non-ASCII routing token' do
+        with_one_and_two_servers(p) do |dc|
+          assert dc.set('raw', "\xff".b, 0, raw: true, p_token: 'é')
+          assert dc.set('marshal', { a: "\xff".b }, 0, p_token: 'é')
+          assert dc.append('raw', "\xfe".b, p_token: 'é')
+          dc.set_multi({ 'm1' => "\xff".b, 'm2' => 'café' }, 0, raw: true, p_token: 'é')
+
+          assert_equal "\xff\xfe".b, dc.get('raw', raw: true).b
+          assert_equal({ a: "\xff".b }, dc.get('marshal'))
+          assert_equal "\xff".b, dc.get('m1', raw: true).b
+          assert_equal 'café'.b, dc.get('m2', raw: true).b
+        end
+      end
+
+      it 'set_multi stores UTF-8, binary and UTF-16 values together' do
+        with_one_and_two_servers(p) do |dc|
+          values = { 'utf8' => 'café', 'binary' => "\xff\xfe".b, 'utf16' => 'hé'.encode('UTF-16LE') }
+          dc.set_multi(values, 0, raw: true)
+
+          values.each { |k, v| assert_equal v.b, dc.get(k, raw: true).b, k }
+        end
+      end
     end
   end
 end

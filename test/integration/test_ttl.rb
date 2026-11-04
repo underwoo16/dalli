@@ -19,11 +19,10 @@ describe 'TTL behavior' do
         memcached_persistent(p) do |dc|
           key = 'foo'
 
-          assert dc.set(key, 'bar', 1)
+          assert dc.set(key, 'bar', 3)
           assert_equal 'bar', dc.get(key)
-          sleep 1.2
 
-          assert_nil dc.get(key)
+          wait_until { dc.get(key).nil? }
         end
       end
 
@@ -32,6 +31,124 @@ describe 'TTL behavior' do
           assert_raises ArgumentError do
             dc.set('foo', 'bar', [])
           end
+        end
+      end
+
+      it 'raises error with a client level expires_in that is not a whole number' do
+        assert_raises(ArgumentError) { Dalli::Client.new('foo', { expires_in: 'abc' }) }
+        assert_equal 300, Dalli::Client.new('foo', { expires_in: '300' }).instance_variable_get(:@options)[:expires_in]
+      end
+
+      # memcached rejects an expiry it can't hold with CLIENT_ERROR, which a
+      # quiet block or set_multi silently discarded. A String that isn't a
+      # whole number became 0, which means no expiry at all.
+      describe 'with a TTL memcached cannot use' do
+        bad_ttls = [2**40, 2**31, -(2**31) - 1, 'abc', '10x', Float::INFINITY]
+
+        it 'raises ArgumentError from every operation that takes a TTL and stores nothing' do
+          memcached_persistent(p) do |_dc, port|
+            dc = single_server_client(port)
+            dc.flush
+            dc.set('existing', 'value')
+            conn_mgr = dc.send(:ring).servers.first.instance_variable_get(:@connection_manager)
+
+            bad_ttls.each do |bad|
+              assert_raises(ArgumentError, "set #{bad.inspect}") { dc.set('new', 'value', bad) }
+              assert_raises(ArgumentError, "add #{bad.inspect}") { dc.add('new', 'value', bad) }
+              assert_raises(ArgumentError, "replace #{bad.inspect}") { dc.replace('existing', 'changed', bad) }
+              assert_raises(ArgumentError, "touch #{bad.inspect}") { dc.touch('existing', bad) }
+              assert_raises(ArgumentError, "gat #{bad.inspect}") { dc.gat('existing', bad) }
+              assert_raises(ArgumentError, "incr #{bad.inspect}") { dc.incr('counter', 1, bad, 0) }
+              assert_raises(ArgumentError, "set_multi #{bad.inspect}") { dc.set_multi({ 'new' => 'value' }, bad) }
+            end
+
+            assert_predicate conn_mgr, :connected?, 'a bad TTL must not tear down the connection'
+            assert_nil dc.get('new')
+            assert_nil dc.get('counter')
+            assert_equal 'value', dc.get('existing')
+          end
+        end
+
+        it 'raises inside a quiet block instead of silently doing nothing' do
+          memcached_persistent(p) do |_dc, port|
+            dc = single_server_client(port)
+            dc.flush
+
+            dc.quiet do
+              dc.set('earlier', 'kept')
+              assert_raises(ArgumentError) { dc.set('new', 'value', 2**40) }
+            end
+
+            assert_equal 'kept', dc.get('earlier')
+            assert_nil dc.get('new')
+          end
+        end
+
+        it 'raises from fetch_with_lock before calling the block' do
+          memcached_persistent(p) do |dc|
+            dc.flush
+            called = false
+
+            assert_raises(ArgumentError) { dc.fetch_with_lock('new', ttl: 2**40) { called = true } }
+            refute called
+          end
+        end
+
+        it 'raises from fetch, cas and cas! before calling the block' do
+          memcached_persistent(p) do |dc|
+            dc.flush
+            dc.set('existing', 'value')
+            called = false
+
+            assert_raises(ArgumentError) { dc.fetch('new', 2**40, nil) { called = true } }
+            assert_raises(ArgumentError) { dc.fetch('existing', 'abc', nil) { called = true } }
+            assert_raises(ArgumentError) { dc.cas('existing', 2**40) { called = true } }
+            assert_raises(ArgumentError) { dc.cas!('new', 'abc') { called = true } }
+            refute called
+            assert_nil dc.get('new')
+            assert_equal 'value', dc.get('existing')
+          end
+        end
+      end
+
+      it 'accepts the largest relative and absolute TTLs, and a TTL given as a String of decimal digits' do
+        memcached_persistent(p) do |dc|
+          dc.flush
+
+          assert dc.set('relative', 'value', 30 * 24 * 60 * 60)
+          assert dc.set('absolute', 'value', (2**31) - 1)
+          assert dc.set('string', 'value', '300')
+          assert_equal %w[value value value], [dc.get('relative'), dc.get('absolute'), dc.get('string')]
+          assert_operator dc.get_with_metadata('string', return_ttl_remaining: true)[:ttl_remaining], :>, 0
+        end
+      end
+
+      it 'stores a TTL over 30 days as the Unix time it becomes' do
+        memcached_persistent(p) do |dc|
+          dc.flush
+          year = 365 * 24 * 60 * 60
+
+          assert dc.set('year', 'value', year)
+          ttl = dc.get_with_metadata('year', return_ttl_remaining: true)[:ttl_remaining]
+
+          assert_in_delta year, ttl, 5
+          assert_equal 'value', dc.fetch('fetched', year, nil) { 'value' }
+          assert_in_delta year, dc.get_with_metadata('fetched', return_ttl_remaining: true)[:ttl_remaining], 5
+        end
+      end
+
+      # memcached accepts a negative TTL and stores the item as already expired
+      it 'accepts a negative TTL, which expires the item' do
+        memcached_persistent(p) do |dc|
+          dc.flush
+          dc.set('existing', 'value')
+
+          assert dc.set('expired', 'value', -1)
+          assert dc.touch('existing', -1)
+          assert dc.set('oldest', 'value', -(2**31))
+          assert_nil dc.get('expired')
+          assert_nil dc.get('existing')
+          assert_nil dc.get('oldest')
         end
       end
     end

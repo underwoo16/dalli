@@ -29,7 +29,23 @@ module Dalli
   class ServerError < DalliError; end
 
   # socket/server communication error that can be retried
-  class RetryableNetworkError < NetworkError; end
+  class RetryableNetworkError < NetworkError
+    def initialize(message = nil, request_sent: false)
+      super(message)
+      @request_sent = request_sent
+    end
+
+    # True when some of the failed request was handed to the socket, so
+    # memcached may have applied it even though its reply was lost. Only a
+    # request that is safe to send twice is retried then.
+    def request_sent?
+      @request_sent
+    end
+  end
+
+  # a multi-get reply named a key that wasn't requested, so the rest of that
+  # server's replies can't be trusted
+  class UnexpectedReplyKeyError < DalliError; end
 
   # Implements the NullObject pattern to store an application-defined value for 'Key not found' responses.
   class NilObject; end # rubocop:disable Lint/EmptyClass
@@ -67,6 +83,7 @@ require_relative 'dalli/compressor'
 require_relative 'dalli/cache_result'
 require_relative 'dalli/client'
 require_relative 'dalli/key_manager'
+require_relative 'dalli/key_grouping'
 require_relative 'dalli/pipelined_getter'
 require_relative 'dalli/pipelined_setter'
 require_relative 'dalli/pipelined_deleter'

@@ -17,6 +17,30 @@ require 'securerandom'
 Dalli.logger = Logger.new($stdout)
 Dalli.logger.level = Logger::ERROR
 
+# Records every client a test creates, so each one is closed after the test.
+# A client left open keeps its connections until GC, and on TruffleRuby a run
+# used to reach about 900 open connections on one memcached, which could hit
+# memcached's connection limit.
+module TrackedClients
+  @clients = []
+  @lock = Mutex.new
+
+  def self.add(client)
+    @lock.synchronize { @clients << client }
+  end
+
+  def self.close_all
+    clients = @lock.synchronize { @clients.slice!(0..) }
+    clients.each(&:close)
+  end
+
+  def initialize(...)
+    super
+    TrackedClients.add(self)
+  end
+end
+Dalli::Client.prepend(TrackedClients)
+
 # Checks if memcached is installed and loads the version,
 # supported protocols
 raise StandardError, 'No supported version of memcached could be found.' unless MemcachedManager.version
@@ -27,6 +51,12 @@ CertificateGenerator.generate
 module Minitest
   class Spec
     include Memcached::Helper
+
+    def after_teardown
+      super
+    ensure
+      TrackedClients.close_all
+    end
 
     def assert_error(error, regexp = nil, &)
       ex = assert_raises(error, &)
@@ -51,6 +81,18 @@ module Minitest
       valid_cas?(rsp)
     end
 
+    # memcached's clock ticks once a second, so an item with a TTL of N
+    # seconds expires somewhere between N - 1 and N seconds after it's set.
+    # Tests use a TTL long enough to read the item back first, then wait here
+    # for it to expire rather than sleeping a fixed time.
+    def wait_until(timeout: 10, interval: 0.2)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      until yield
+        flunk "condition not met within #{timeout}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        sleep interval
+      end
+    end
+
     def with_connectionpool
       require 'connection_pool'
       yield
@@ -63,6 +105,62 @@ module Minitest
         yield
       ensure
         Dalli.logger = old
+      end
+    end
+
+    # Each multi-get, as a lambda returning { key => value }. The block forms
+    # fail on a key yielded twice.
+    MULTI_GETS = {
+      'get_multi' => ->(dc, keys) { dc.get_multi(keys) },
+      'get_multi with a block' => lambda do |dc, keys|
+        collect_yields { |results| dc.get_multi(keys) { |k, v| results << [k, v] } }
+      end,
+      'get_multi_cas' => ->(dc, keys) { dc.get_multi_cas(keys).transform_values(&:first) },
+      'get_multi_cas with a block' => lambda do |dc, keys|
+        collect_yields { |results| dc.get_multi_cas(keys) { |k, (v, _)| results << [k, v] } }
+      end,
+      'get_multi_with_metadata' => ->(dc, keys) { dc.get_multi_with_metadata(keys).transform_values { _1[:value] } },
+      'get_multi_with_metadata with a block' => lambda do |dc, keys|
+        collect_yields { |results| dc.get_multi_with_metadata(keys) { |k, meta| results << [k, meta[:value]] } }
+      end
+    }.freeze
+
+    def self.collect_yields
+      results = []
+      yield results
+      if results.uniq(&:first) != results
+        raise Minitest::Assertion, "a key was yielded more than once: #{results.inspect}"
+      end
+
+      results.to_h
+    end
+
+    # Yields a single-server client, then a two-server one, both with options.
+    # Each is closed afterwards, so a Ruby that closes sockets only on GC
+    # doesn't run memcached out of connections.
+    def with_one_and_two_servers(protocol, **options, &)
+      memcached_persistent(protocol, 21_345) do |_, port1|
+        with_closed_client("localhost:#{port1}", options, &)
+        memcached_persistent(protocol, 21_346) do |_, port2|
+          with_closed_client(["localhost:#{port1}", "localhost:#{port2}"], options, &)
+        end
+      end
+    end
+
+    def with_closed_client(servers, options)
+      dc = Dalli::Client.new(servers, options)
+      yield dc
+    ensure
+      dc&.close
+    end
+
+    # A multi-get's results are returned under the caller's keys: equal, and
+    # with the same encoding, so result.key?(key) holds for a binary key too
+    def assert_caller_keys(expected, result)
+      assert_equal expected, result
+      expected.each_key do |key|
+        assert result.key?(key), "#{key.inspect} missing from #{result.keys.inspect}"
+        assert_equal key.encoding, result.keys.find { _1 == key }.encoding
       end
     end
   end

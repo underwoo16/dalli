@@ -96,6 +96,28 @@ end
 
 `drain_deferred_responses` only sends a `noop` to servers that were sent quiet requests since they were last drained, so calling it when nothing is pending costs nothing.
 
+## Network Errors and Retries
+
+When a request fails with a network error (a refused connection, a reset, or a read that times out), Dalli reconnects and retries it. A server that fails `socket_max_failures` times in a row is marked down, and requests to it raise `Dalli::NetworkError` (or, with `failover`, go to another server).
+
+On CRuby, a read that waits longer than `socket_timeout` raises a network error, which is retried and counted like any other. JRuby and TruffleRuby don't time out a blocked socket read, so on those engines a server that accepts a request and never replies blocks the caller indefinitely. Pass `enforce_read_timeout: true` to apply `socket_timeout` there too:
+
+```ruby
+Dalli::Client.new('localhost:11211', socket_timeout: 0.5, enforce_read_timeout: true)
+```
+
+It limits how long Dalli waits for a reply to start, which covers a server that stops answering. A server that stops partway through a reply can still block. It's off by default because the check costs throughput, noticeably on JRuby. It has no effect on CRuby, which doesn't need it, or on TLS connections.
+
+`get_multi` and `get_multi_cas` wait up to `socket_timeout` for any server to send more of its replies, on every engine. The wait starts again each time data arrives, so a large batch can take longer than `socket_timeout` in total. A server that sends nothing for `socket_timeout` counts as a failed read, as it would for `get`.
+
+A request that failed after some of it was sent may have been applied by memcached even though its reply never arrived. Dalli only sends such a request again when applying it twice is harmless: reads, `touch`, `set`, `replace` and `delete` without a CAS, and the multi-key operations. For `incr`, `decr`, `append`, `prepend`, `add`, writes with a CAS (`set_cas`, `replace_cas`, `delete_cas`, `cas`, `cas!`), and `get_with_metadata` with `vivify_ttl` or `recache_ttl` (which `fetch_with_lock` uses), it raises `Dalli::NetworkError` instead, since the write may or may not have happened. A retried `delete` can return false if the first attempt deleted the key.
+
+A connection that sat unused for over a second is checked before the next request. If memcached (with `idle_timeout`), a load balancer or a firewall closed it meanwhile, Dalli reconnects before sending, so the request isn't lost and doesn't count as a failure. A connection dropped without the other end closing it can't be detected this way, and a request on it fails as above.
+
+The multi-key operations (`get_multi`, `get_multi_cas`, `get_multi_with_metadata`, `set_multi` and `delete_multi`) skip a server that is already down when they start: its keys are missing from the result, or go to another server with `failover`. A server that fails during the operation is retried. If the retry can't connect to it, then without `failover` the operation raises `Dalli::NetworkError`, rather than returning that server's keys as misses or leaving them unwritten, and with `failover` its keys go to another server, or are left out when no server is left. If the retry connects but the server fails again, it's marked down partway through the operation, which raises `Dalli::NetworkError` with or without `failover`.
+
+A retried `get_multi` or `get_multi_cas` starts the batch again, so a block passed to either can be yielded a key it was already yielded before the error. Make the block safe to call twice for a key, or call the method without a block and use the Hash it returns. `get_multi_with_metadata` yields only after every server has replied, so its block sees each key once.
+
 ## Security Note
 
 By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted data with Marshal can lead to remote code execution. If you cache user-controlled data, consider using a safer serializer:
@@ -123,6 +145,10 @@ The digest is MD5 by default. `digest_class:` takes any object that responds to 
 
 See the [5.0-Upgrade.md](5.0-Upgrade.md) guide for upgrade information.
 
+### Counters and verify_reply_keys
+
+memcached names an item made by auto-create for a base64-encoded key (one with whitespace, control or non-ASCII characters) by its raw key bytes in later replies. Since 5.2.3, Dalli creates counters for such keys with an add rather than auto-create. Items created before then, or by other clients, can still be named that way until memcached releases a fix (1.6.45 and earlier behave this way). If keys passed to `incr` or `decr` with an initial value can contain untrusted input, set `verify_reply_keys: true` until then: multi-gets then ignore replies for keys they didn't request, at a cost of about 15% per multi-get.
+
 ## TLS
 
 Pass an `OpenSSL::SSL::SSLContext` as `ssl_context:` to connect over TLS. Certificate and hostname verification come only from that context: Dalli adds no checks of its own. A bare `OpenSSL::SSL::SSLContext.new` verifies nothing, so it accepts any certificate from any server. Configure the context to verify both:
@@ -147,6 +173,14 @@ A failed TLS handshake counts as a failed connection attempt, like a refused con
 `Rack::Session::Dalli` stores Rack sessions in memcached. If a session is deleted while a request is using it (for example, when the user logs out in another tab during a slow request), the store doesn't write the session back, so a logged-out session can't come back. It replaces the app's response with a `401 Wrong session ID` that expires the session cookie.
 
 The app has already run by then, so whatever it did (database writes, emails, and so on) has happened, and only its response is lost. If a request needs a different outcome, check that the session still exists before making the changes.
+
+Set `expire_after` to give sessions an expiry. It sets both the cookie's expiry and the TTL of the session in memcached. Without it, sessions are stored with no expiry: a session stays in memcached until it's deleted (for example by a logout) or evicted, and a stolen session cookie keeps working until then.
+
+```ruby
+use Rack::Session::Dalli, memcache_server: 'mc.example.com:11211', expire_after: 2 * 60 * 60 # two hours
+```
+
+A stored session that can't be decoded, for example after changing the serializer or removing a class that sessions stored, is treated as missing: the request gets a new, empty session and a new cookie, and Dalli logs a warning.
 
 ## OpenTelemetry Tracing
 
