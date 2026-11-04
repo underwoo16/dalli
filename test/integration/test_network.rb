@@ -581,6 +581,34 @@ describe 'Network' do
           end
         end
 
+        it 'sends large values over SSL' do
+          memcached_ssl_persistent(p) do |dc|
+            large = Dalli::Protocol::Meta::LARGE_VALUE_BYTES
+            values = Array.new(3) { |i| ["big#{i}", "#{i}:".b + ('x' * (large + i)).b] }.to_h
+
+            values.each { |key, value| dc.set(key, value, nil, raw: true) }
+
+            stored = values.keys.to_h { |key| [key, dc.get(key, raw: true)] }
+
+            assert_equal values, stored
+          end
+        end
+
+        it 'sends large values in a quiet block over SSL' do
+          memcached_ssl_persistent(p) do |dc|
+            large = Dalli::Protocol::Meta::LARGE_VALUE_BYTES
+            values = Array.new(3) { |i| ["big#{i}", "#{i}:".b + ('x' * (large + i)).b] }.to_h
+
+            dc.multi do
+              values.each { |key, value| dc.set(key, value, nil, raw: true) }
+            end
+
+            stored = values.keys.to_h { |key| [key, dc.get(key, raw: true)] }
+
+            assert_equal values, stored
+          end
+        end
+
         it 'allow TCP connections to be configured for keepalive' do
           memcached_persistent(p) do |_, port|
             dc = Dalli::Client.new("localhost:#{port}", keepalive: true)

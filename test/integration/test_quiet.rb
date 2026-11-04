@@ -26,6 +26,47 @@ describe 'Quiet behavior' do
         end
       end
 
+      # A large value is buffered as three parts (request, value, terminator).
+      # A few sets are sent in one vectored write; once more than
+      # MAX_VECTORED_PARTS are buffered they are joined first.
+      large_value_counts = [2, 20]
+      large_value_counts.each do |count|
+        it "sends #{count} large values in a quiet block intact and in order" do
+          memcached_persistent(p) do |dc|
+            dc.close
+            dc.flush
+            large = Dalli::Protocol::Meta::LARGE_VALUE_BYTES
+            values = Array.new(count) { |i| ["large#{i}", "#{i}:".b + ('x' * (large + i)).b] }.to_h
+            values['small'] = 'sv'
+
+            dc.multi do
+              values.each { |key, value| dc.set(key, value, nil, raw: true) }
+            end
+
+            stored = values.keys.to_h { |key| [key, dc.get(key, raw: true)] }
+
+            assert_equal values, stored
+          end
+        end
+      end
+
+      it 'sends values either side of the large value threshold in a quiet block' do
+        memcached_persistent(p) do |dc|
+          dc.close
+          dc.flush
+          large = Dalli::Protocol::Meta::LARGE_VALUE_BYTES
+          values = [large - 1, large, large + 1].to_h { |size| ["size#{size}", 'v' * size] }
+
+          dc.quiet do
+            values.each { |key, value| dc.set(key, value, nil, raw: true) }
+          end
+
+          stored = values.keys.to_h { |key| [key, dc.get(key, raw: true)] }
+
+          assert_equal values, stored
+        end
+      end
+
       # Earlier quiet writes sit in the connection's write buffer until the
       # block's noop; a value that fails to marshal must not throw them away.
       {
