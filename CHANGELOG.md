@@ -4,6 +4,23 @@ Dalli Changelog
 Unreleased
 ==========
 
+5.3.2
+==========
+
+Bug fixes:
+
+- A signal arriving while `Dalli::Compressor` or `Dalli::GzipCompressor` was compressing or decompressing could make Ruby's zlib return before it had finished (ruby/zlib#49). Depending on the Ruby and zlib gem versions, that raised `Zlib::BufError` or `Zlib::DataError`, or stored a truncated value that later failed to decompress. Both compressors now keep finishing the stream until zlib reports its end. `GzipCompressor` no longer goes through `GzipWriter` and `GzipReader`, so it now always returns decompressed values as binary strings, as `Compressor` does (#1299)
+
+5.3.1
+==========
+
+Bug fixes:
+
+- `Rack::Session::Dalli`'s 401 for a session deleted mid-request called `Hash#slice` on the session options. A Rails session store puts an `ActionDispatch::Request::Session::Options` there, so the 401 raised `NoMethodError` instead of expiring the cookie (#1291, @seballot)
+
+5.3.0
+==========
+
 New features:
 
 - `enforce_read_timeout: true` makes JRuby and TruffleRuby give up waiting for a reply after `socket_timeout`, as CRuby does. Without it, a server that accepted a request but never replied blocked the caller indefinitely on those engines, including in `get` and `get_multi`. A server that stops partway through a reply can still block. It's off by default because it costs about 8% of single-key throughput on TruffleRuby and 20-29% on JRuby, and it has no effect on CRuby or TLS connections
@@ -33,6 +50,7 @@ Bug fixes:
 - `get_multi_cas`, and `get_multi` on more than one server, returned a server's keys as misses when it sent nothing within `socket_timeout`, without retrying or counting a failure. They now treat it like any read timeout: the batch is retried, and `Dalli::NetworkError` is raised once the server is marked down, as `get`, `get_multi_with_metadata` and single-server `get_multi` already did. `socket_timeout` also used to cover the whole batch, so a large reply that was still arriving could be cut off, with its remaining keys returned as misses. The wait now starts again whenever data arrives (#1285)
 - A reply key marked base64 that isn't valid base64 raised `ArgumentError` from `get_multi`, `get_multi_cas` and `get_multi_with_metadata`, which callers rescuing `Dalli::DalliError` didn't catch. It now raises `Dalli::DalliError`. Found by the new fuzz targets
 - `set_multi` and `delete_multi` on more than one server retried forever, hanging the caller, when a server accepted their writes and then closed the connection before replying. Each quiet write reset the server's failure count, so it never reached `socket_max_failures`. Only a request whose reply is read resets it now, and the server is marked down and `Dalli::NetworkError` raised, as for `get`
+- Since 5.2.0, on JRuby with TLS, Dalli could wait `socket_timeout` for part of a reply that had already arrived, because jruby-openssl can hold it where neither `IO.select` nor OpenSSL's `pending` reports it. With the multi-get change above (#1285), that wait would have made `get_multi` raise `Dalli::NetworkError`. Dalli now reads on JRuby until the TLS socket would block
 
 Other changes:
 
