@@ -112,6 +112,24 @@ module Dalli
       @servers.first.socket_timeout
     end
 
+    # Install scoped handling only on clients that use with_timeout, so other
+    # clients keep their existing request path.
+    def enable_timeout(context = nil)
+      lock do
+        return @timeout_context if @timeout_context
+
+        context ||= ScopedTimeout.new
+        @servers.each do |server|
+          server.extend(ScopedTimeout::Server)
+          server.timeout_context = context
+        end
+        @timeout_context = context
+        extend(ScopedTimeout::Ring)
+
+        context
+      end
+    end
+
     def close
       @servers.each(&:close)
     end

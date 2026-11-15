@@ -798,6 +798,21 @@ module Dalli
       yield self
     end
 
+    ##
+    # Uses a temporary socket timeout for operations on this client in the
+    # calling thread or fiber. Yields this client and returns the block's result.
+    # Nested scopes restore the outer timeout, including on exceptional exits.
+    # This limits socket waits, not the total duration of the block or retries.
+    def with_timeout(timeout)
+      unless (timeout.is_a?(Integer) || timeout.is_a?(Float)) && timeout.finite? && timeout.positive?
+        raise ArgumentError, 'timeout must be a finite, positive number of seconds'
+      end
+      raise ArgumentError, 'with_timeout requires a block' unless block_given?
+
+      @timeout_context ||= ring.enable_timeout
+      @timeout_context.with(timeout) { yield self }
+    end
+
     private
 
     # Raised before the request reaches a server: RequestFormatter enforces the
@@ -1118,7 +1133,9 @@ module Dalli
     end
 
     def ring
-      @ring ||= Dalli::Ring.new(@normalized_servers, @options)
+      @ring ||= Dalli::Ring.new(@normalized_servers, @options).tap do |new_ring|
+        new_ring.enable_timeout(@timeout_context) if @timeout_context
+      end
     end
 
     ##

@@ -118,6 +118,24 @@ The multi-key operations (`get_multi`, `get_multi_cas`, `get_multi_with_metadata
 
 A retried `get_multi` or `get_multi_cas` starts the batch again, so a block passed to either can be yielded a key it was already yielded before the error. Make the block safe to call twice for a key, or call the method without a block and use the Hash it returns. `get_multi_with_metadata` yields only after every server has replied, so its block sees each key once.
 
+### Temporary socket timeouts
+
+Use `with_timeout` to give one operation, or several operations, a different socket timeout without creating another client:
+
+```ruby
+result = dalli.with_timeout(5) do |d|
+  d.get_multi(key_array)
+end
+```
+
+The block receives the same client and returns its last expression. You can also omit the block argument and call `dalli` directly. The timeout must be a finite, positive Integer or Float, in seconds.
+
+The override applies only to this client in the calling thread or fiber; other clients and callers keep their own timeouts. Nested blocks temporarily replace the outer timeout. The previous timeout is restored on exit, including after an exception, and existing connections are reused. As with normal client operations, sharing a client requires `threadsafe: true` (the default).
+
+The override covers reads, writes, TLS handshakes, and the fallback for connection establishment when no explicit `connect_timeout` is configured. It preserves the Ruby-engine limitations of `socket_timeout` and `enforce_read_timeout` described above. It is not a deadline for the block or the whole operation: multiple socket waits and retries can take longer than the supplied value.
+
+Quiet replies deferred with `defer_drain: true` use the timeout active when they are drained. They do not retain a timeout from a block that has already ended.
+
 ## Security Note
 
 By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted data with Marshal can lead to remote code execution. If you cache user-controlled data, consider using a safer serializer:

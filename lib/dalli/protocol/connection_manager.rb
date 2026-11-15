@@ -115,6 +115,22 @@ module Dalli
         @socket_timeout ||= @options[:socket_timeout]
       end
 
+      # Called while the server is locked. Also changes the options used by
+      # reconnects, and restores whichever socket exists when the scope ends.
+      def with_socket_timeout(timeout)
+        previous = socket_timeout
+        return yield if previous == timeout
+
+        begin
+          @socket_timeout = @options[:socket_timeout] = timeout
+          apply_socket_timeout
+          yield
+        ensure
+          @socket_timeout = @options[:socket_timeout] = previous
+          apply_socket_timeout
+        end
+      end
+
       # Before a request: closes a connection left mid-request, reconnects
       # after a fork, and checks a connection that sat idle (see
       # #close_if_closed_by_peer!). Idle time runs from the start of the last
@@ -433,6 +449,19 @@ module Dalli
       end
 
       private
+
+      def apply_socket_timeout
+        return unless @sock
+
+        @sock.options[:socket_timeout] = socket_timeout
+        io = @sock.to_io
+        if io.respond_to?(:timeout=)
+          io.timeout = socket_timeout
+        else
+          # A zero socket-option timeout restores an unbounded wait.
+          Dalli::Socket::TCP.configure_timeout(io, socket_timeout: socket_timeout || 0)
+        end
+      end
 
       # One write per flush. A TLS socket sends each argument of
       # write(*parts) as its own record and system call, so the parts are
