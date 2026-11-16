@@ -60,5 +60,11 @@ module Dalli
     def init_threadsafe
       @lock = Monitor.new
     end
+
+    private
+
+    def synchronize_connection(&)
+      @lock.synchronize(&)
+    end
   end
 end

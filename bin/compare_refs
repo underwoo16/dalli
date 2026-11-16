@@ -23,6 +23,9 @@
 #   ROUNDS - rounds over all the refs (default: 3)
 #   RUNS   - timed runs per workload in each round (default: 7)
 #   ONLY   - comma-separated workload names to run (default: all)
+#   TIMEOUT_MODE - on refs with with_timeout: idle (after a scope), scope
+#                  (inside one scope), or block (one scope per operation).
+#                  Refs without with_timeout use their normal operations.
 #
 # A difference under about 2% is within run-to-run noise on a laptop.
 
@@ -72,13 +75,24 @@ module CompareRefsWorker
 
     runs = Integer(ENV.fetch('RUNS', '7'))
     only = ENV['ONLY']&.split(',')&.map(&:strip)
+    timeout_mode = ENV.fetch('TIMEOUT_MODE', nil) if client.respond_to?(:with_timeout)
+    abort 'TIMEOUT_MODE must be idle, scope, or block' if timeout_mode && !%w[idle scope block].include?(timeout_mode)
+    client.with_timeout(5) { client } if timeout_mode
     results = {}
     workloads(client).each do |name, (iterations, method, operation)|
       next if only && !only.include?(name)
       # Older releases lack some of the methods
       next unless client.respond_to?(method)
 
-      results[name] = median_rate(iterations, runs, operation)
+      if timeout_mode == 'block'
+        unscoped_operation = operation
+        operation = -> { client.with_timeout(5) { unscoped_operation.call } }
+      end
+      results[name] = if timeout_mode == 'scope'
+                        client.with_timeout(5) { median_rate(iterations, runs, operation) }
+                      else
+                        median_rate(iterations, runs, operation)
+                      end
     end
     client.close
     puts JSON.generate(label => results)

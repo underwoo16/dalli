@@ -4,6 +4,10 @@ Dalli Changelog
 Unreleased
 ==========
 
+New features:
+
+- `Client#with_timeout(seconds) { |client| ... }` temporarily overrides `socket_timeout` for operations on that client in the calling thread or fiber. It reuses existing connections, supports nested scopes, and restores the previous timeout even when the block raises. An explicit `connect_timeout` is unchanged; the override is a socket wait limit, not a deadline for the whole block.
+
 5.3.2
 ==========
 
