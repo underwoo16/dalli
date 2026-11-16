@@ -33,34 +33,24 @@ module Dalli
         timeout = Thread.current[STORAGE_KEY]&.[](@timeout_context)
         return super unless timeout
 
-        with_timeout_lock do
+        synchronize_connection do
           @connection_manager.with_socket_timeout(timeout) { super }
         end
       end
 
       def alive?
-        if @lock
-          return true if @lock.synchronize { connected? }
-        elsif connected?
-          return true
-        end
+        return true if synchronize_connection { connected? }
 
         timeout = Thread.current[STORAGE_KEY]&.[](@timeout_context)
         return super unless timeout
 
-        with_timeout_lock do
+        synchronize_connection do
           @connection_manager.with_socket_timeout(timeout) { super }
         end
       end
 
       def with_socket_timeout(timeout, &)
         @connection_manager.with_socket_timeout(timeout, &)
-      end
-
-      private
-
-      def with_timeout_lock(&)
-        @lock ? @lock.synchronize(&) : yield
       end
     end
 

@@ -31,15 +31,22 @@ describe 'scoped socket timeouts' do
     end
   end
 
-  def with_delayed_server(delay, fail_first: false, stall_writes: false)
-    listener = TCPServer.new('127.0.0.1', 0)
+  def with_delayed_server(delay, listener: TCPServer.new('127.0.0.1', 0), fail_first: false,
+                          stall_writes: false, ssl_context: nil, handshake_delay: 0, on_get: nil)
     connections = Queue.new
     failed = false
     failure_lock = Mutex.new
     acceptor = Thread.new do
       loop do
         socket = listener.accept
-        worker = Thread.new(socket) do |connection|
+        worker = Thread.new(socket) do |raw|
+          connection = raw
+          if ssl_context
+            sleep handshake_delay
+            connection = OpenSSL::SSL::SSLSocket.new(raw, ssl_context)
+            connection.sync_close = true
+            connection.accept
+          end
           pending = []
           while (line = connection.gets)
             words = line.split
@@ -47,6 +54,7 @@ describe 'scoped socket timeouts' do
             when 'version'
               connection.write("VERSION 1.6.45\r\n")
             when 'mg'
+              on_get&.call(words[1])
               fail_request = failure_lock.synchronize do
                 if fail_first && !failed
                   failed = true
@@ -68,20 +76,25 @@ describe 'scoped socket timeouts' do
               connection.write("MN\r\n")
               pending.clear
             when 'ms'
-              sleep 5 if stall_writes
+              if stall_writes
+                sleep 2
+                connection.read(words[2].to_i + 2)
+                connection.write("HD c1\r\n")
+              end
             end
           end
-        rescue IOError, SystemCallError
+        rescue IOError, SystemCallError, OpenSSL::SSL::SSLError
           nil
         ensure
-          connection.close
+          connection.close unless connection.closed?
         end
         connections << [socket, worker]
       end
     rescue IOError, SystemCallError
       nil
     end
-    yield "127.0.0.1:#{listener.addr[1]}"
+    address = listener.is_a?(UNIXServer) ? listener.path : "127.0.0.1:#{listener.addr[1]}"
+    yield address
   ensure
     listener&.close
     acceptor&.kill
@@ -92,6 +105,13 @@ describe 'scoped socket timeouts' do
       worker.kill
       worker.join
     end
+  end
+
+  def timeout_server_ssl_context
+    context = OpenSSL::SSL::SSLContext.new
+    context.cert = OpenSSL::X509::Certificate.new(File.read(CertificateGenerator::MEMCACHED_CERT_PATH))
+    context.key = OpenSSL::PKey.read(File.read(CertificateGenerator::MEMCACHED_PK_PATH))
+    context
   end
 
   it 'yields the same client, returns results, and restores a warm socket' do
@@ -210,16 +230,59 @@ describe 'scoped socket timeouts' do
     skip 'reliable IO write timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
 
     with_delayed_server(0, stall_writes: true) do |address|
-      client = Dalli::Client.new(address, socket_timeout: 1, socket_max_failures: 1, socket_failure_delay: 0,
-                                          raw: true, sndbuf: 4096, value_max_bytes: 32 * 1024 * 1024)
+      client = Dalli::Client.new(address, socket_timeout: 8, socket_max_failures: 1, socket_failure_delay: 0,
+                                          down_retry_delay: 0, raw: true, sndbuf: 4096,
+                                          value_max_bytes: 32 * 1024 * 1024)
       client.alive!
       observations = observe_timeouts(client)
+      value = 'x' * (16 * 1024 * 1024)
 
       assert_raises(Dalli::NetworkError) do
-        client.with_timeout(0.04) { client.set('large', 'x' * (16 * 1024 * 1024)) }
+        client.with_timeout(0.04) { client.set('large', value) }
       end
       assert_empty observations
-      assert_equal 1, client.send(:ring).socket_timeout
+      assert_equal 8, client.send(:ring).socket_timeout
+      assert op_addset_succeeds(client.set('large', value))
+    end
+  end
+
+  it 'applies the timeout to a delayed UNIX socket reply' do
+    skip 'reliable blocking read timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
+    skip 'UNIX sockets unsupported on Windows' if RbConfig::CONFIG['host_os'].match?(/mingw|mswin/)
+
+    Dir.mktmpdir do |directory|
+      listener = UNIXServer.new(File.join(directory, 'timeout.sock'))
+      with_delayed_server(0.3, listener: listener) do |address|
+        client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1,
+                                            socket_failure_delay: 0, down_retry_delay: 0)
+
+        assert_raises(Dalli::NetworkError) { client.with_timeout(0.05) { client.get('a') } }
+        assert_equal 'v', client.get('a')
+      end
+    end
+  end
+
+  it 'applies the timeout to a delayed TLS reply' do
+    skip 'reliable TLS read timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
+
+    with_delayed_server(0.3, ssl_context: timeout_server_ssl_context) do |address|
+      client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1, socket_failure_delay: 0,
+                                          down_retry_delay: 0, ssl_context: CertificateGenerator.ssl_context)
+
+      assert_raises(Dalli::NetworkError) { client.with_timeout(0.05) { client.get('a') } }
+      assert_equal 'v', client.get('a')
+    end
+  end
+
+  it 'applies the timeout to a delayed TLS handshake' do
+    skip 'reliable TLS handshake timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
+
+    with_delayed_server(0, ssl_context: timeout_server_ssl_context, handshake_delay: 0.3) do |address|
+      client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1, socket_failure_delay: 0,
+                                          down_retry_delay: 0, ssl_context: CertificateGenerator.ssl_context)
+
+      assert_raises(Dalli::RingError) { client.with_timeout(0.05) { client.get('a') } }
+      assert_equal 'v', client.get('a')
     end
   end
 
@@ -278,6 +341,29 @@ describe 'scoped socket timeouts' do
         worker&.kill
         worker&.join
       end
+    end
+  end
+
+  it 'restores the socket before a concurrent caller can use it' do
+    requested = Queue.new
+    with_delayed_server(0.3, on_get: ->(key) { requested << true if key == 'scoped' }) do |address|
+      client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1,
+                                          socket_failure_delay: 0, down_retry_delay: 0, enforce_read_timeout: true)
+      scoped = Thread.new do
+        client.with_timeout(0.1) { client.get('scoped') }
+      rescue Dalli::NetworkError
+        :timeout
+      end
+      Timeout.timeout(5) { requested.pop }
+      ordinary = Thread.new { client.get('ordinary') }
+
+      assert_equal :timeout, scoped.value
+      assert_equal 'v', ordinary.value
+    ensure
+      scoped&.kill
+      ordinary&.kill
+      scoped&.join
+      ordinary&.join
     end
   end
 

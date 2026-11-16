@@ -260,6 +260,10 @@ module Dalli
 
       private
 
+      def synchronize_connection
+        yield
+      end
+
       # Dalli::Client strips credentials before a server is built, so this is
       # only for a server built directly from a URI with them
       def warn_uri_credentials(user_creds)
