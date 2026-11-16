@@ -114,6 +114,10 @@ describe 'scoped socket timeouts' do
     context
   end
 
+  def tls_io_timeout_supported?
+    RUBY_ENGINE == 'ruby' && Gem::Version.new(OpenSSL::VERSION) >= Gem::Version.new('3.3.0')
+  end
+
   it 'yields the same client, returns results, and restores a warm socket' do
     with_timeout_client do |client|
       client.set('timeout-key', 'value')
@@ -263,7 +267,7 @@ describe 'scoped socket timeouts' do
   end
 
   it 'applies the timeout to a delayed TLS reply' do
-    skip 'reliable TLS read timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
+    skip 'TLS I/O timeouts require CRuby and ruby-openssl 3.3 or later' unless tls_io_timeout_supported?
 
     with_delayed_server(0.3, ssl_context: timeout_server_ssl_context) do |address|
       client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1, socket_failure_delay: 0,
@@ -275,7 +279,7 @@ describe 'scoped socket timeouts' do
   end
 
   it 'applies the timeout to a delayed TLS handshake' do
-    skip 'reliable TLS handshake timeouts require CRuby' unless RUBY_ENGINE == 'ruby'
+    skip 'TLS I/O timeouts require CRuby and ruby-openssl 3.3 or later' unless tls_io_timeout_supported?
 
     with_delayed_server(0, ssl_context: timeout_server_ssl_context, handshake_delay: 0.3) do |address|
       client = Dalli::Client.new(address, socket_timeout: 2, socket_max_failures: 1, socket_failure_delay: 0,
@@ -283,6 +287,20 @@ describe 'scoped socket timeouts' do
 
       assert_raises(Dalli::RingError) { client.with_timeout(0.05) { client.get('a') } }
       assert_equal 'v', client.get('a')
+    end
+  end
+
+  it 'preserves existing TLS timeout behavior with older ruby-openssl' do
+    skip 'older CRuby ruby-openssl only' unless RUBY_ENGINE == 'ruby' && !tls_io_timeout_supported?
+
+    with_delayed_server(0.3, ssl_context: timeout_server_ssl_context, handshake_delay: 0.3) do |address|
+      client = Dalli::Client.new(address, socket_timeout: 0.05, socket_max_failures: 1, socket_failure_delay: 0,
+                                          ssl_context: CertificateGenerator.ssl_context)
+
+      assert_equal 'v', client.get('a')
+      client.close
+
+      assert_equal 'v', client.with_timeout(0.01) { client.get('a') }
     end
   end
 

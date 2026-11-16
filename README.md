@@ -132,7 +132,7 @@ The block receives the same client and returns its last expression. You can also
 
 The override applies only to this client in the calling thread or fiber; other clients and callers keep their own timeouts. Nested blocks temporarily replace the outer timeout. The previous timeout is restored on exit, including after an exception, and existing connections are reused. As with normal client operations, sharing a client requires `threadsafe: true` (the default).
 
-The override covers reads, writes, TLS handshakes, and the fallback for connection establishment when no explicit `connect_timeout` is configured. It preserves the Ruby-engine limitations of `socket_timeout` and `enforce_read_timeout` described above. It is not a deadline for the block or the whole operation: multiple socket waits and retries can take longer than the supplied value.
+The override covers reads, writes, TLS handshakes, and the fallback for connection establishment when no explicit `connect_timeout` is configured. It preserves the Ruby-engine limitations of `socket_timeout` and `enforce_read_timeout` described above. On CRuby, ruby-openssl before 3.3.0 does not enforce socket timeouts on TLS I/O or handshakes; this applies to `socket_timeout` as well as `with_timeout` and depends on the installed ruby-openssl version. It is not a deadline for the block or the whole operation: multiple socket waits and retries can take longer than the supplied value.
 
 Quiet replies deferred with `defer_drain: true` use the timeout active when they are drained. They do not retain a timeout from a block that has already ended.
 
